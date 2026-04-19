@@ -1,0 +1,21 @@
+# ASR model (Apple Silicon MLX)
+mlx-qwen3-asr==0.3.2
+
+# Web framework
+fastapi==0.135.3
+uvicorn==0.43.0
+python-multipart==0.0.24
+websockets==16.0
+
+# VAD and speaker embedding
+silero-vad==6.2.1
+Resemblyzer==0.1.4
+onnxruntime==1.24.4
+torch==2.11.0
+torchaudio==2.11.0
+
+# Model hub client (used for snapshot_download)
+huggingface_hub==1.9.0
+
+# Numerical
+numpy==2.4.4

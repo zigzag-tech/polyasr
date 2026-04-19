@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.muxpod.asr-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VENV__/bin/python</string>
+        <string>__REPO__/server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Model: Qwen/Qwen3-ASR-0.6B (fast) or Qwen/Qwen3-ASR-1.7B (best) -->
+        <key>ASR_MODEL</key>
+        <string>Qwen/Qwen3-ASR-1.7B</string>
+        <!-- Use HF mirror when huggingface.co is unreachable -->
+        <key>HF_ENDPOINT</key>
+        <string>https://hf-mirror.com</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/server.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO__/server.stderr.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
