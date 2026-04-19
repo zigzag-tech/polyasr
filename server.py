@@ -20,11 +20,13 @@ import sys
 import io
 import json
 import time
+import uuid
 import struct
 import asyncio
 import tempfile
 import logging
 import wave
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +47,19 @@ MODEL_NAME = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 _session = None
 _vad_model = None
 _voice_encoder = None
+
+# -------------------------------------------------------------------------
+# Session logging: audio + events are archived per-session for troubleshooting
+# (VAD tuning, speaker-embedding diagnostics, ASR regression tests). Disabled
+# by setting ASR_LOG_DIR="". Raw PCM is written incrementally (crash-safe)
+# and converted to FLAC (lossless, ~60% of WAV size) at session close.
+# -------------------------------------------------------------------------
+_log_dir_env = os.environ.get("ASR_LOG_DIR", "logs")
+if _log_dir_env:
+    _p = Path(_log_dir_env)
+    LOG_DIR = _p if _p.is_absolute() else Path(__file__).parent / _p
+else:
+    LOG_DIR = None
 
 # Silero VAD: chunk must be exactly 512 samples at 16kHz (~32ms).
 VAD_CHUNK_SAMPLES = 512
@@ -139,6 +154,119 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+class SessionLogger:
+    """Per-connection logger. Writes raw PCM to *input.pcm* as audio arrives
+    (append-only, crash-safe) and events to *events.jsonl*. On close, PCM is
+    transcoded to lossless FLAC and the .pcm file is removed.
+
+    All methods swallow exceptions — logging failures must not break ASR.
+    """
+
+    def __init__(self, kind: str = "ws"):
+        self.enabled = False
+        self.dir: Optional[Path] = None
+        self.pcm_file = None
+        self.events_file = None
+        self.start_monotonic = time.monotonic()
+        self.session_id = uuid.uuid4().hex[:8]
+        self.bytes_written = 0
+        if LOG_DIR is None:
+            return
+        try:
+            now = datetime.now()
+            day_dir = LOG_DIR / "sessions" / now.strftime("%Y-%m-%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            self.dir = day_dir / f"{now.strftime('%H%M%S')}-{kind}-{self.session_id}"
+            self.dir.mkdir()
+            self.pcm_file = open(self.dir / "input.pcm", "wb")
+            self.events_file = open(self.dir / "events.jsonl", "w", encoding="utf-8")
+            self.enabled = True
+            self.event("start", {"session_id": self.session_id, "kind": kind,
+                                 "model": MODEL_NAME})
+        except Exception:
+            log.exception("SessionLogger init failed; logging disabled for this session")
+            self.enabled = False
+
+    def _ms(self) -> int:
+        return int((time.monotonic() - self.start_monotonic) * 1000)
+
+    def audio(self, data: bytes) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.pcm_file.write(data)
+            self.bytes_written += len(data)
+        except Exception:
+            log.exception("SessionLogger.audio write failed")
+
+    def event(self, type_: str, data: Optional[dict] = None) -> None:
+        if not self.enabled:
+            return
+        try:
+            ev = {"t_ms": self._ms(), "type": type_}
+            if data:
+                ev.update(data)
+            self.events_file.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            self.events_file.flush()
+        except Exception:
+            log.exception("SessionLogger.event write failed")
+
+    def close(self) -> None:
+        """Close handles and transcode PCM → FLAC. Safe to call once."""
+        if not self.enabled:
+            return
+        self.enabled = False
+        self.event("close", {"audio_bytes": self.bytes_written,
+                             "duration_ms": self._ms()})
+        try:
+            if self.pcm_file:
+                self.pcm_file.close()
+            if self.events_file:
+                self.events_file.close()
+        except Exception:
+            log.exception("SessionLogger close failed")
+        # Transcode PCM → FLAC (lossless, ~40% smaller than WAV).
+        pcm_path = self.dir / "input.pcm"
+        flac_path = self.dir / "input.flac"
+        try:
+            if pcm_path.exists() and pcm_path.stat().st_size > 0:
+                import soundfile as sf
+                pcm = np.fromfile(str(pcm_path), dtype=np.int16)
+                sf.write(str(flac_path), pcm, 16000,
+                         format="FLAC", subtype="PCM_16")
+                pcm_path.unlink()
+                log.info("Session log: %s (%.2fs audio)", self.dir,
+                         len(pcm) / 16000.0)
+            elif pcm_path.exists():
+                pcm_path.unlink()  # empty file — drop it
+        except Exception:
+            log.exception("FLAC transcode failed; keeping .pcm")
+
+
+def _log_http_request(audio_bytes: bytes, filename: str, text: str,
+                       language: Optional[str]) -> None:
+    """Archive an HTTP batch request + its transcription."""
+    if LOG_DIR is None:
+        return
+    try:
+        now = datetime.now()
+        day_dir = LOG_DIR / "http" / now.strftime("%Y-%m-%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        rid = uuid.uuid4().hex[:8]
+        prefix = day_dir / f"{now.strftime('%H%M%S')}-{rid}"
+        suffix = Path(filename).suffix if filename else ".bin"
+        (prefix.with_suffix(suffix)).write_bytes(audio_bytes)
+        meta = {"timestamp": now.isoformat(timespec="seconds"),
+                "filename": filename,
+                "language": language,
+                "model": MODEL_NAME,
+                "text": text}
+        (prefix.with_suffix(".json")).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        log.exception("HTTP request logging failed")
+
+
 def pcm_to_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     """Wrap raw PCM16 mono data in a WAV container."""
     buf = io.BytesIO()
@@ -204,6 +332,8 @@ async def transcribe(
 
         elapsed = time.monotonic() - t0
         log.info("Transcribed in %.2fs: %s", elapsed, result.text[:80])
+        _log_http_request(content, file.filename or "upload",
+                          result.text, language)
 
         fmt = (response_format or "json").lower()
         if fmt == "text":
@@ -323,6 +453,7 @@ async def ws_transcribe(ws: WebSocket):
     last_partial_text = ""
     pending_len_at_last_partial = 0
     loop = asyncio.get_event_loop()
+    slog = SessionLogger("ws")
 
     async def apply_events(events):
         nonlocal committed_text, last_partial_text, pending_len_at_last_partial
@@ -332,6 +463,8 @@ async def ws_transcribe(ws: WebSocket):
                 pending_audio.extend(ev[1])
             elif ev[0] == 'boundary':
                 if len(pending_audio) < MIN_COMMIT_BYTES:
+                    slog.event("boundary_short", {
+                        "pending_bytes": len(pending_audio)})
                     pending_audio.clear()
                     pending_len_at_last_partial = 0
                     continue
@@ -342,23 +475,27 @@ async def ws_transcribe(ws: WebSocket):
                     None, compute_embedding, chunk_bytes)
 
                 accept = True
+                sim_val = None
                 if embedding is None:
                     # Too-short or preprocessing failure — default to accept
                     # (VAD already said it was speech).
-                    pass
+                    slog.event("embedding_skipped",
+                               {"chunk_sec": len(chunk_bytes) / BYTES_PER_SEC})
                 elif reference_embedding is None:
                     reference_embedding = embedding
                     log.info(
                         "Enrolled main speaker (%.2fs of speech)",
                         len(chunk_bytes) / BYTES_PER_SEC,
                     )
+                    slog.event("enrolled",
+                               {"ref_sec": len(chunk_bytes) / BYTES_PER_SEC})
                 else:
-                    sim = cosine_sim(embedding, reference_embedding)
-                    if sim >= SPEAKER_SIM_THRESHOLD:
-                        log.info("Chunk accepted (speaker sim=%.2f)", sim)
+                    sim_val = cosine_sim(embedding, reference_embedding)
+                    if sim_val >= SPEAKER_SIM_THRESHOLD:
+                        log.info("Chunk accepted (speaker sim=%.2f)", sim_val)
                     else:
                         accept = False
-                        log.info("Chunk rejected (speaker sim=%.2f)", sim)
+                        log.info("Chunk rejected (speaker sim=%.2f)", sim_val)
 
                 if accept:
                     chunk_text = await _transcribe_buffer(pending_audio)
@@ -366,10 +503,23 @@ async def ws_transcribe(ws: WebSocket):
                         committed_text = _join_text(
                             committed_text, chunk_text.strip())
                         log.info("Commit: %s", chunk_text.strip()[:60])
+                        slog.event("commit", {
+                            "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                            "speaker_sim": sim_val,
+                            "chunk_text": chunk_text.strip(),
+                            "committed_text": committed_text,
+                        })
                         if committed_text != last_partial_text:
                             last_partial_text = committed_text
                             await ws.send_json({"partial": committed_text})
+                    else:
+                        slog.event("commit_empty", {
+                            "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                            "speaker_sim": sim_val})
                 else:
+                    slog.event("reject", {
+                        "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                        "speaker_sim": sim_val})
                     # Rejected chunk — correct the UI back to committed text
                     # so any stale partial from this chunk disappears.
                     if last_partial_text != committed_text:
@@ -403,42 +553,55 @@ async def ws_transcribe(ws: WebSocket):
                             last_partial_text = full
                             await ws.send_json({"partial": full})
                             log.info("Partial: %s", full[:80])
+                            slog.event("partial", {"text": full})
                     last_partial_time = now
                     pending_len_at_last_partial = len(pending_audio)
 
                 continue
 
             if "bytes" in data:
+                slog.audio(data["bytes"])
                 staging.extend(data["bytes"])
                 events = _process_staged_audio(staging, prev_window, gate_state)
                 await apply_events(events)
             elif "text" in data:
                 msg = json.loads(data["text"])
                 if msg.get("action") == "stop":
+                    slog.event("stop_requested")
                     # Flush remaining staged audio, then transcribe tail
                     events = _process_staged_audio(staging, prev_window, gate_state)
                     await apply_events(events)
                     if len(pending_audio) > BYTES_PER_SEC * 0.3:
                         chunk_bytes = bytes(pending_audio)
                         accept = True
+                        sim_val = None
                         if reference_embedding is not None:
                             emb = await loop.run_in_executor(
                                 None, compute_embedding, chunk_bytes)
                             if emb is not None:
-                                sim = cosine_sim(emb, reference_embedding)
-                                if sim < SPEAKER_SIM_THRESHOLD:
+                                sim_val = cosine_sim(emb, reference_embedding)
+                                if sim_val < SPEAKER_SIM_THRESHOLD:
                                     accept = False
                                     log.info(
                                         "Final tail rejected (speaker sim=%.2f)",
-                                        sim,
+                                        sim_val,
                                     )
                         if accept:
                             tail = await _transcribe_buffer(pending_audio)
                             if tail and tail.strip():
                                 committed_text = _join_text(
                                     committed_text, tail.strip())
+                                slog.event("final_tail_commit", {
+                                    "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                                    "speaker_sim": sim_val,
+                                    "chunk_text": tail.strip()})
+                        else:
+                            slog.event("final_tail_reject", {
+                                "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                                "speaker_sim": sim_val})
                         pending_audio.clear()
                     final_text = committed_text.strip()
+                    slog.event("final", {"text": final_text})
                     if final_text:
                         await ws.send_json({"final": final_text})
                         log.info("Final (stop): %s", final_text[:80])
@@ -447,12 +610,20 @@ async def ws_transcribe(ws: WebSocket):
 
     except WebSocketDisconnect:
         log.info("WebSocket client disconnected")
+        slog.event("disconnect")
     except Exception as e:
         log.exception("WebSocket error: %s", e)
+        slog.event("error", {"message": str(e)})
         try:
             await ws.send_json({"error": str(e)})
         except Exception:
             pass
+    finally:
+        # Finalize session log (PCM → FLAC) in executor so we don't block.
+        try:
+            await loop.run_in_executor(None, slog.close)
+        except Exception:
+            log.exception("Session logger close failed")
 
 
 async def _transcribe_buffer(audio_buffer: bytearray) -> str:

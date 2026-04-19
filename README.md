@@ -75,6 +75,39 @@ launchctl load ~/Library/LaunchAgents/com.muxpod.asr-server.plist
 
 Logs land next to `server.py` (`server.stdout.log`, `server.stderr.log`).
 
+## Session logging
+
+Every WebSocket session and every HTTP batch request is archived for troubleshooting (VAD tuning, speaker-embedding diagnostics, ASR regression tests, record keeping). Layout:
+
+```
+logs/
+├── sessions/
+│   └── 2026-04-19/
+│       └── 143755-ws-a1b2c3d4/
+│           ├── input.flac       # lossless mono 16 kHz, full session audio
+│           └── events.jsonl     # per-event timeline (see below)
+└── http/
+    └── 2026-04-19/
+        ├── 143812-e5f6a7b8.wav  # uploaded audio, original format
+        └── 143812-e5f6a7b8.json # {filename, language, model, text}
+```
+
+Each line in `events.jsonl` is one event with a millisecond timestamp relative to session start:
+
+| type | fields | meaning |
+|---|---|---|
+| `start` | `session_id`, `kind`, `model` | WS connected |
+| `enrolled` | `ref_sec` | First chunk → main-speaker reference |
+| `commit` | `chunk_sec`, `speaker_sim`, `chunk_text`, `committed_text` | Chunk transcribed and folded in |
+| `reject` | `chunk_sec`, `speaker_sim` | Dropped — sim below threshold |
+| `partial` | `text` | UI partial sent |
+| `final` | `text` | Final sent to client |
+| `close` | `audio_bytes`, `duration_ms` | Session done |
+
+Storage cost: FLAC of 16 kHz mono speech is roughly 20 KB per second (~70 MB/hr). Disable logging entirely by setting `ASR_LOG_DIR=""`. Override the directory with `ASR_LOG_DIR=/path/to/archive`.
+
+The `logs/` directory is git-ignored.
+
 ## Tuning
 
 Edit constants near the top of `server.py`:

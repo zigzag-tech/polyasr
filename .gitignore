@@ -7,3 +7,6 @@ server.stdout.log
 server.stderr.log
 *.bak
 .DS_Store
+
+# Per-session audio/event archives (written at runtime for troubleshooting)
+logs/

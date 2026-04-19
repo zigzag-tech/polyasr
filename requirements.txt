@@ -19,3 +19,6 @@ huggingface_hub==1.9.0
 
 # Numerical
 numpy==2.4.4
+
+# Audio I/O (used for writing per-session FLAC archives)
+soundfile>=0.12.1
