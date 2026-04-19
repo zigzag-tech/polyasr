@@ -1,0 +1,17 @@
+name: asr_client
+description: Dart/Flutter client for the asr-server streaming ASR service.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.4.0
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  record: ^6.0.0
+  web_socket_channel: ^3.0.1
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
