@@ -313,7 +313,6 @@ async def transcribe(
     file: UploadFile = File(...),
     model: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
-    context: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
 ):
     t0 = time.monotonic()
@@ -329,8 +328,6 @@ async def transcribe(
         kwargs = {}
         if language:
             kwargs["language"] = language
-        if context:
-            kwargs["context"] = context
         result = session.transcribe(tmp.name, **kwargs)
 
         elapsed = time.monotonic() - t0
@@ -365,11 +362,8 @@ async def transcribe(
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 
-# Transcribe the recent tail often enough for live captions to feel current.
-# Final transcription still runs on the full accepted utterance.
-PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
-PARTIAL_TAIL_SEC = float(os.environ.get("ASR_PARTIAL_TAIL_SEC", "4.0"))
-PARTIAL_TAIL_BYTES = int(PARTIAL_TAIL_SEC * BYTES_PER_SEC)
+# Transcribe every N seconds of accumulated audio
+PARTIAL_INTERVAL_SEC = 1.0
 
 # VAD windowing: 160ms analysis windows (5 Silero chunks each).
 GATE_WINDOW_SEC = 0.16
@@ -443,39 +437,27 @@ async def ws_transcribe(ws: WebSocket):
     await ws.accept()
     log.info("WebSocket client connected")
 
-    # Tail-first streaming transcription.
-    #
-    # We keep a single growing audio buffer of accepted primary-speaker
-    # speech (`gated_audio`) for the final pass, but live partials only
-    # transcribe the recent speech tail. Re-transcribing the whole utterance
-    # on each tick makes the last few spoken words lag further behind as
-    # the utterance grows.
-    #
-    # `pending_audio` is still the current silence-bounded chunk — we use
-    # it for speaker-enrollment/rejection at each boundary. Once a chunk
-    # is accepted (or is the enrollment chunk), its bytes are appended to
-    # `gated_audio`, transcribed once into `committed_text`, and cleared;
-    # rejected chunks are discarded.
-    gated_audio = bytearray()
-    pending_audio = bytearray()
+    # Incremental transcription state:
+    # - committed_text holds fragments already transcribed from prior chunks.
+    # - pending_audio holds audio since the last silence-boundary commit.
+    # - reference_embedding holds the main speaker's voice fingerprint, set
+    #   from the first chunk with enough speech; subsequent chunks are
+    #   accepted only if their cosine similarity to this reference passes.
     committed_text = ""
+    pending_audio = bytearray()
     staging = bytearray()
     prev_window = []
     gate_state = {'silence_run': 0, 'gate_was_open': False}
     reference_embedding = None
     last_partial_time = time.monotonic()
     last_partial_text = ""
-    gated_len_at_last_partial = 0
     pending_len_at_last_partial = 0
     loop = asyncio.get_event_loop()
     slog = SessionLogger("ws")
 
-    # ASR context hint (distilled terminal vocabulary, etc.).
-    asr_context = ""
-
     async def apply_events(events):
-        nonlocal reference_embedding, committed_text, gated_len_at_last_partial
-        nonlocal pending_len_at_last_partial
+        nonlocal committed_text, last_partial_text, pending_len_at_last_partial
+        nonlocal reference_embedding
         for ev in events:
             if ev[0] == 'audio':
                 pending_audio.extend(ev[1])
@@ -495,6 +477,8 @@ async def ws_transcribe(ws: WebSocket):
                 accept = True
                 sim_val = None
                 if embedding is None:
+                    # Too-short or preprocessing failure — default to accept
+                    # (VAD already said it was speech).
                     slog.event("embedding_skipped",
                                {"chunk_sec": len(chunk_bytes) / BYTES_PER_SEC})
                 elif reference_embedding is None:
@@ -514,43 +498,37 @@ async def ws_transcribe(ws: WebSocket):
                         log.info("Chunk rejected (speaker sim=%.2f)", sim_val)
 
                 if accept:
-                    gated_audio.extend(pending_audio)
-                    chunk_text = (
-                        await _transcribe_buffer(
-                            bytearray(chunk_bytes),
-                            context=asr_context,
-                        )
-                        or ""
-                    ).strip()
-                    if chunk_text:
-                        committed_text = _join_text(committed_text, chunk_text)
-                    slog.event("chunk_accepted", {
-                        "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
-                        "speaker_sim": sim_val,
-                        "gated_sec": len(gated_audio) / BYTES_PER_SEC,
-                        "text": chunk_text,
-                    })
+                    chunk_text = await _transcribe_buffer(pending_audio)
+                    if chunk_text and chunk_text.strip():
+                        committed_text = _join_text(
+                            committed_text, chunk_text.strip())
+                        log.info("Commit: %s", chunk_text.strip()[:60])
+                        slog.event("commit", {
+                            "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                            "speaker_sim": sim_val,
+                            "chunk_text": chunk_text.strip(),
+                            "committed_text": committed_text,
+                        })
+                        if committed_text != last_partial_text:
+                            last_partial_text = committed_text
+                            await ws.send_json({"partial": committed_text})
+                    else:
+                        slog.event("commit_empty", {
+                            "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                            "speaker_sim": sim_val})
                 else:
                     slog.event("reject", {
                         "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
                         "speaker_sim": sim_val})
+                    # Rejected chunk — correct the UI back to committed text
+                    # so any stale partial from this chunk disappears.
+                    if last_partial_text != committed_text:
+                        last_partial_text = committed_text
+                        await ws.send_json(
+                            {"partial": committed_text})
 
                 pending_audio.clear()
                 pending_len_at_last_partial = 0
-
-    async def transcribe_partial() -> str:
-        """Transcribe only the current tail and prepend committed text.
-        Returns stripped text ("" if empty/failed)."""
-        if len(pending_audio) < int(BYTES_PER_SEC * 0.3):
-            return committed_text
-        tail_audio = pending_audio
-        if len(tail_audio) > PARTIAL_TAIL_BYTES:
-            tail_audio = tail_audio[-PARTIAL_TAIL_BYTES:]
-        tail_text = (
-            await _transcribe_buffer(bytearray(tail_audio), context=asr_context)
-            or ""
-        ).strip()
-        return _join_text(committed_text, tail_text)
 
     try:
         while True:
@@ -561,22 +539,22 @@ async def ws_transcribe(ws: WebSocket):
                 await apply_events(events)
 
                 now = time.monotonic()
-                total_new_audio = (
-                    (len(gated_audio) - gated_len_at_last_partial)
-                    + (len(pending_audio) - pending_len_at_last_partial)
-                )
-                if total_new_audio <= 0:
+                pending_sec = len(pending_audio) / BYTES_PER_SEC
+                if pending_sec < 0.3:
                     continue
 
-                if now - last_partial_time >= PARTIAL_INTERVAL_SEC:
-                    text = await transcribe_partial()
-                    if text and text != last_partial_text:
-                        last_partial_text = text
-                        await ws.send_json({"partial": text})
-                        log.info("Partial: %s", text[:80])
-                        slog.event("partial", {"text": text})
+                # Periodic partial transcription on pending (unsettled) tail
+                if (now - last_partial_time >= PARTIAL_INTERVAL_SEC
+                        and len(pending_audio) > pending_len_at_last_partial):
+                    tail = await _transcribe_buffer(pending_audio)
+                    if tail and tail.strip():
+                        full = _join_text(committed_text, tail.strip())
+                        if full and full != last_partial_text:
+                            last_partial_text = full
+                            await ws.send_json({"partial": full})
+                            log.info("Partial: %s", full[:80])
+                            slog.event("partial", {"text": full})
                     last_partial_time = now
-                    gated_len_at_last_partial = len(gated_audio)
                     pending_len_at_last_partial = len(pending_audio)
 
                 continue
@@ -588,19 +566,11 @@ async def ws_transcribe(ws: WebSocket):
                 await apply_events(events)
             elif "text" in data:
                 msg = json.loads(data["text"])
-                if "context" in msg:
-                    asr_context = msg["context"]
-                    slog.event("context_set", {"len": len(asr_context)})
-                    log.info("ASR context set (%d chars)", len(asr_context))
                 if msg.get("action") == "stop":
                     slog.event("stop_requested")
-                    # Flush remaining staged audio, apply boundary events
+                    # Flush remaining staged audio, then transcribe tail
                     events = _process_staged_audio(staging, prev_window, gate_state)
                     await apply_events(events)
-
-                    # Tail: if pending has enough speech, speaker-check
-                    # and (if accepted) roll it into gated_audio before
-                    # the final transcription pass.
                     if len(pending_audio) > BYTES_PER_SEC * 0.3:
                         chunk_bytes = bytes(pending_audio)
                         accept = True
@@ -617,19 +587,20 @@ async def ws_transcribe(ws: WebSocket):
                                         sim_val,
                                     )
                         if accept:
-                            gated_audio.extend(pending_audio)
-                            slog.event("final_tail_accepted", {
-                                "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
-                                "speaker_sim": sim_val})
+                            tail = await _transcribe_buffer(pending_audio)
+                            if tail and tail.strip():
+                                committed_text = _join_text(
+                                    committed_text, tail.strip())
+                                slog.event("final_tail_commit", {
+                                    "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                                    "speaker_sim": sim_val,
+                                    "chunk_text": tail.strip()})
                         else:
                             slog.event("final_tail_reject", {
                                 "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
                                 "speaker_sim": sim_val})
                         pending_audio.clear()
-
-                    final_text = ""
-                    if len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
-                        final_text = (await _transcribe_buffer(gated_audio, context=asr_context) or "").strip()
+                    final_text = committed_text.strip()
                     slog.event("final", {"text": final_text})
                     if final_text:
                         await ws.send_json({"final": final_text})
@@ -655,7 +626,7 @@ async def ws_transcribe(ws: WebSocket):
             log.exception("Session logger close failed")
 
 
-async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
+async def _transcribe_buffer(audio_buffer: bytearray) -> str:
     """Transcribe the accumulated audio buffer."""
     wav_bytes = pcm_to_wav_bytes(bytes(audio_buffer))
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -666,11 +637,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
         session = get_session()
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_event_loop()
-        kwargs = {}
-        if context:
-            kwargs["context"] = context
-        result = await loop.run_in_executor(
-            None, lambda: session.transcribe(tmp.name, **kwargs))
+        result = await loop.run_in_executor(None, session.transcribe, tmp.name)
         return result.text
     except Exception as e:
         log.exception("Transcription error")
