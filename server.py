@@ -457,6 +457,7 @@ async def ws_transcribe(ws: WebSocket):
     # rejected chunks are discarded.
     gated_audio = bytearray()
     pending_audio = bytearray()
+    partial_audio = bytearray()  # all audio for partial transcription (never cleared)
     committed_text = ""
     staging = bytearray()
     prev_window = []
@@ -478,6 +479,7 @@ async def ws_transcribe(ws: WebSocket):
         for ev in events:
             if ev[0] == 'audio':
                 pending_audio.extend(ev[1])
+                partial_audio.extend(ev[1])
             elif ev[0] == 'boundary':
                 if len(pending_audio) < MIN_COMMIT_BYTES:
                     slog.event("boundary_short", {
@@ -538,15 +540,15 @@ async def ws_transcribe(ws: WebSocket):
                 pending_len_at_last_partial = 0
 
     async def transcribe_partial() -> str:
-        """Transcribe the full pending audio and prepend committed text.
+        """Transcribe all audio heard so far for live partials.
         Returns stripped text ("" if empty/failed)."""
-        if len(pending_audio) < int(BYTES_PER_SEC * 0.3):
+        if len(partial_audio) < int(BYTES_PER_SEC * 0.3):
             return committed_text
         text = (
-            await _transcribe_buffer(bytearray(pending_audio), context=asr_context)
+            await _transcribe_buffer(bytearray(partial_audio), context=asr_context)
             or ""
         ).strip()
-        return _join_text(committed_text, text)
+        return text
 
     try:
         while True:
