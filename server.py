@@ -569,7 +569,7 @@ async def ws_transcribe(ws: WebSocket):
                     if text and text != last_partial_text:
                         delta = None
                         if text.startswith(last_partial_text):
-                            delta = text[len(last_partial_text):].lstrip()
+                            delta = text[len(last_partial_text):]
                         if delta:
                             await ws.send_json({"partial": text, "delta": delta})
                         else:
