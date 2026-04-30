@@ -368,8 +368,6 @@ BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 # Transcribe the recent tail often enough for live captions to feel current.
 # Final transcription still runs on the full accepted utterance.
 PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
-PARTIAL_TAIL_SEC = float(os.environ.get("ASR_PARTIAL_TAIL_SEC", "4.0"))
-PARTIAL_TAIL_BYTES = int(PARTIAL_TAIL_SEC * BYTES_PER_SEC)
 
 # VAD windowing: 160ms analysis windows (5 Silero chunks each).
 GATE_WINDOW_SEC = 0.16
@@ -377,7 +375,8 @@ GATE_WINDOW_BYTES = int(GATE_WINDOW_SEC * BYTES_PER_SEC)
 
 # Incremental commit: after this many consecutive non-speech windows (and
 # at least MIN_COMMIT_SEC of pending speech), run speaker check and
-# transcribe the chunk. Subsequent partials only re-transcribe the new tail.
+# transcribe the chunk. Partials transcribe the full pending audio so the
+# client always sees the complete utterance so far.
 COMMIT_SILENCE_WINDOWS = 4       # ~640ms of silence marks a chunk boundary
 MIN_COMMIT_SEC = 1.5             # don't commit chunks shorter than this
 MIN_COMMIT_BYTES = int(MIN_COMMIT_SEC * BYTES_PER_SEC)
@@ -539,18 +538,15 @@ async def ws_transcribe(ws: WebSocket):
                 pending_len_at_last_partial = 0
 
     async def transcribe_partial() -> str:
-        """Transcribe only the current tail and prepend committed text.
+        """Transcribe the full pending audio and prepend committed text.
         Returns stripped text ("" if empty/failed)."""
         if len(pending_audio) < int(BYTES_PER_SEC * 0.3):
             return committed_text
-        tail_audio = pending_audio
-        if len(tail_audio) > PARTIAL_TAIL_BYTES:
-            tail_audio = tail_audio[-PARTIAL_TAIL_BYTES:]
-        tail_text = (
-            await _transcribe_buffer(bytearray(tail_audio), context=asr_context)
+        text = (
+            await _transcribe_buffer(bytearray(pending_audio), context=asr_context)
             or ""
         ).strip()
-        return _join_text(committed_text, tail_text)
+        return _join_text(committed_text, text)
 
     try:
         while True:
@@ -571,8 +567,14 @@ async def ws_transcribe(ws: WebSocket):
                 if now - last_partial_time >= PARTIAL_INTERVAL_SEC:
                     text = await transcribe_partial()
                     if text and text != last_partial_text:
+                        delta = None
+                        if text.startswith(last_partial_text):
+                            delta = text[len(last_partial_text):].lstrip()
+                        if delta:
+                            await ws.send_json({"partial": text, "delta": delta})
+                        else:
+                            await ws.send_json({"partial": text})
                         last_partial_text = text
-                        await ws.send_json({"partial": text})
                         log.info("Partial: %s", text[:80])
                         slog.event("partial", {"text": text})
                     last_partial_time = now
