@@ -365,9 +365,14 @@ async def transcribe(
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 
-# Transcribe the recent tail often enough for live captions to feel current.
-# Final transcription still runs on the full accepted utterance.
+# Partial interval: how often to emit a live partial.
 PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
+
+# Sliding window for live partials.  The model re-transcribes the last N
+# seconds of audio on every partial tick.  20 s covers almost all natural
+# sentences; the final pass still transcribes the full utterance.
+PARTIAL_WINDOW_SEC = float(os.environ.get("ASR_PARTIAL_WINDOW_SEC", "20.0"))
+PARTIAL_WINDOW_BYTES = int(PARTIAL_WINDOW_SEC * BYTES_PER_SEC)
 
 # VAD windowing: 160ms analysis windows (5 Silero chunks each).
 GATE_WINDOW_SEC = 0.16
@@ -540,12 +545,16 @@ async def ws_transcribe(ws: WebSocket):
                 pending_len_at_last_partial = 0
 
     async def transcribe_partial() -> str:
-        """Transcribe all audio heard so far for live partials.
+        """Transcribe the last N seconds of audio for live partials.
+        Uses a sliding window so long utterances don't blow up.
         Returns stripped text ("" if empty/failed)."""
-        if len(partial_audio) < int(BYTES_PER_SEC * 0.3):
+        buf = partial_audio
+        if len(buf) > PARTIAL_WINDOW_BYTES:
+            buf = buf[-PARTIAL_WINDOW_BYTES:]
+        if len(buf) < int(BYTES_PER_SEC * 0.3):
             return committed_text
         text = (
-            await _transcribe_buffer(bytearray(partial_audio), context=asr_context)
+            await _transcribe_buffer(bytearray(buf), context=asr_context)
             or ""
         ).strip()
         return text
