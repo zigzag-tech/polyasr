@@ -15,6 +15,7 @@ Health:
   GET /health
 """
 
+import gc
 import os
 import sys
 import io
@@ -31,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import mlx.core as mx
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
@@ -49,6 +51,11 @@ _session = None
 _vad_model = None
 _voice_encoder = None
 _transcribe_lock = threading.Lock()
+
+# MLX allocates Metal buffers aggressively and never returns them to the OS.
+# Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
+# cache after every transcription so memory stays bounded.
+ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
 
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
@@ -161,6 +168,12 @@ def _prune_protocol_sessions():
     ]
     for sid in stale:
         _protocol_sessions.pop(sid, None)
+
+
+def _clear_mlx_cache() -> None:
+    """Force Python GC then drop unused MLX Metal buffers back to the OS."""
+    gc.collect()
+    mx.metal.clear_cache()
 
 
 def _new_protocol_session(session_id: str) -> AsrProtocolSession:
@@ -462,13 +475,14 @@ async def transcribe(
         tmp.close()
 
         session = get_session()
-        kwargs = {}
+        kwargs = {"max_new_tokens": ASR_MAX_NEW_TOKENS}
         if language:
             kwargs["language"] = language
         if context:
             kwargs["context"] = context
         with _transcribe_lock:
             result = session.transcribe(tmp.name, **kwargs)
+        _clear_mlx_cache()
 
         elapsed = time.monotonic() - t0
         log.info("Transcribed in %.2fs: %s", elapsed, result.text[:80])
@@ -1099,7 +1113,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
         session = get_session()
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_event_loop()
-        kwargs = {}
+        kwargs: dict = {"max_new_tokens": ASR_MAX_NEW_TOKENS}
         if context:
             kwargs["context"] = context
         def run_transcribe():
@@ -1107,6 +1121,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
                 return session.transcribe(tmp.name, **kwargs)
 
         result = await loop.run_in_executor(None, run_transcribe)
+        _clear_mlx_cache()
         return result.text
     except Exception as e:
         log.exception("Transcription error")
