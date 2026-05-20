@@ -1034,7 +1034,17 @@ async def ws_transcribe(ws: WebSocket):
                         pending_audio.clear()
 
                     final_text = ""
-                    if len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
+                    # Fast path: if the utterance fits in the partial window,
+                    # the last partial already transcribed the same audio.
+                    # Skip the redundant full-buffer transcription.
+                    if (
+                        len(gated_audio) >= int(BYTES_PER_SEC * 0.3)
+                        and len(gated_audio) <= PARTIAL_WINDOW_BYTES
+                        and last_partial_text
+                    ):
+                        final_text = last_partial_text
+                        slog.event("final_from_last_partial_fastpath", {"text": final_text})
+                    elif len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
                         final_text = (await _transcribe_buffer(gated_audio, context=asr_context) or "").strip()
                     if not final_text and last_partial_text:
                         final_text = last_partial_text
