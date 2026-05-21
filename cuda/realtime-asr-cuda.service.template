@@ -1,0 +1,25 @@
+[Unit]
+Description=Realtime ASR server (CUDA / Qwen3-ASR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__REPO__/cuda
+Environment=ASR_MODEL=Qwen/Qwen3-ASR-1.7B
+Environment=ASR_DEVICE=cuda:0
+Environment=ASR_DTYPE=bfloat16
+Environment=ASR_PORT=8766
+Environment=ASR_LOG_DIR=__REPO__/cuda/logs
+# Hugging Face cache persists across restarts so model reload is fast.
+Environment=HF_HOME=__HF_HOME__
+ExecStart=__REPO__/cuda/venv/bin/python __REPO__/cuda/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:__LOG_DIR__/realtime-asr-cuda.log
+StandardError=append:__LOG_DIR__/realtime-asr-cuda.err
+
+[Install]
+WantedBy=multi-user.target

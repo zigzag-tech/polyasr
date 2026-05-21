@@ -1,128 +1,226 @@
-# asr-server
+# realtime-asr
 
-Streaming ASR service built around [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) on Apple Silicon (MLX), with speaker-aware filtering so only the main speaker is captured.
+Realtime speech recognition services built around
+[Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B).
 
-## Features
+This repository owns both production ASR backends:
 
-- **Qwen3-ASR** (0.6B or 1.7B) via `mlx-qwen3-asr`, running natively on Apple Silicon. Multilingual (52 languages), strong on CJK and code-switching.
-- **Silero-VAD** for speech/non-speech detection per 160 ms window.
-- **Resemblyzer** speaker embedding: the first ≥1.5 s chunk becomes the "main speaker" reference; subsequent chunks are transcribed only if their cosine similarity to the reference ≥ 0.70 — background speakers are dropped.
-- **Incremental transcription**: at each ~640 ms silence, the completed chunk is transcribed once and folded into a committed prefix. Subsequent partials only re-transcribe the unsettled tail, so cost scales with O(n) not O(n²).
-- **HTTP batch** endpoint for one-shot file uploads (OpenAI-compatible).
+- Apple Silicon / MLX for M-series Macs.
+- NVIDIA CUDA for GPU hosts.
 
-## Endpoints
+Both servers expose the same HTTP and WebSocket contract. Backend-specific
+code stays inside the model loading and transcription adapter paths; clients
+should not need to care whether they are talking to MLX or CUDA.
 
-### `GET /health`
+## Layout
+
+```text
+.
+├── server.py                         # Apple Silicon / MLX server
+├── requirements.txt                  # MLX dependencies
+├── launchd/
+│   └── io.zigzag.realtime-asr.plist.template
+├── cuda/
+│   ├── server.py                     # NVIDIA CUDA server
+│   ├── requirements.txt              # CUDA dependencies
+│   └── realtime-asr-cuda.service.template
+└── client/dart/                      # Dart/Flutter client package
+```
+
+## Backends
+
+| Backend | Entry point | Default port | Runtime | Notes |
+|---|---:|---:|---|---|
+| Apple Silicon / MLX | `server.py` | `8765` | `mlx-qwen3-asr` | Uses the quality-preserving final path by default. Native MLX streaming is available behind `ASR_NATIVE_STREAMING=1`, but is opt-in until quality is acceptable for dictation. |
+| NVIDIA CUDA | `cuda/server.py` | `8766` | `qwen-asr` | Uses transformers backend by default. Native CUDA streaming requires `qwen-asr[vllm]` plus `ASR_BACKEND=vllm`. |
+
+Both backends support:
+
+- Qwen3-ASR 0.6B or 1.7B.
+- Silero VAD speech detection.
+- Resemblyzer main-speaker filtering.
+- Session logging for replay and regression testing.
+- OpenAI-compatible HTTP batch transcription.
+- Benchday ASR WebSocket framing with seq/ack/resume/stop/final/done.
+
+## API
+
+### Health
+
+```http
+GET /health
+```
+
+MLX response:
+
 ```json
-{"status": "ok", "model": "Qwen/Qwen3-ASR-1.7B"}
+{"status":"ok","model":"Qwen/Qwen3-ASR-1.7B"}
 ```
 
-### `POST /v1/audio/transcriptions`
-OpenAI-compatible multipart upload.
+CUDA response includes backend and GPU details:
 
-| Form field | Type | Notes |
+```json
+{
+  "status": "ok",
+  "model": "Qwen/Qwen3-ASR-1.7B",
+  "backend": "cuda",
+  "dtype": "bfloat16"
+}
+```
+
+### HTTP batch
+
+```http
+POST /v1/audio/transcriptions
+```
+
+OpenAI-compatible multipart form fields:
+
+| Field | Type | Notes |
 |---|---|---|
-| `file` | file | Audio (wav/mp3/etc.) |
-| `language` | string (opt) | Language hint |
-| `response_format` | string (opt) | `json` (default), `text`, `verbose_json` |
+| `file` | file | Audio upload. |
+| `language` | string | Optional language hint. |
+| `context` | string | Optional prompt/context hint. |
+| `response_format` | string | `json`, `text`, or `verbose_json`. |
 
-Returns `{"text": "..."}`.
+### WebSocket streaming
 
-### `WS /ws/transcribe`
-Client streams raw **PCM16, 16 kHz, mono** binary frames. Server emits JSON:
-
-```
-{"partial": "text so far..."}   # interim updates while speaking
-{"final":   "complete text"}    # sent on stop
-{"done":    true}               # server is closing the stream
+```text
+WS /ws/transcribe
 ```
 
-To finalize, send `{"action":"stop"}` as a text frame. The server will flush any pending audio, emit the final, then close.
+The client sends a required `start` or `resume` message, then framed PCM16
+16 kHz mono audio frames. The server sends:
+
+```json
+{"type":"partial","partial":"text so far"}
+{"type":"final","text":"complete text"}
+{"type":"done"}
+```
+
+To finish an utterance, send the protocol `stop` message. The server flushes
+pending audio, emits `final`, then emits `done`.
 
 ## Install
 
-Requires Python 3.11+ on Apple Silicon (MLX is Apple-only).
+### Apple Silicon / MLX
 
 ```bash
 python3 -m venv ~/asr-venv
 ~/asr-venv/bin/pip install -r requirements.txt
 ```
 
-First startup will download the model (~500 MB for 0.6B, ~1.4 GB for 1.7B). Set `HF_ENDPOINT=https://hf-mirror.com` if huggingface.co is unreachable from your network.
-
-## Run
+Run:
 
 ```bash
-~/asr-venv/bin/python server.py
+ASR_MODEL=Qwen/Qwen3-ASR-1.7B ~/asr-venv/bin/python server.py
 ```
 
-Env vars:
-- `ASR_MODEL` — `Qwen/Qwen3-ASR-0.6B` (default) or `Qwen/Qwen3-ASR-1.7B`.
-- `HF_ENDPOINT` — model registry mirror (optional).
-
-## Run as a launchd service (macOS)
+Install as a launchd service:
 
 ```bash
-# Point the template at your checkout and venv, then install:
 sed \
   -e "s|__REPO__|$PWD|g" \
   -e "s|__VENV__|$HOME/asr-venv|g" \
-  launchd/com.muxpod.asr-server.plist.template \
-  > ~/Library/LaunchAgents/com.muxpod.asr-server.plist
+  launchd/io.zigzag.realtime-asr.plist.template \
+  > ~/Library/LaunchAgents/io.zigzag.realtime-asr.plist
 
-launchctl load ~/Library/LaunchAgents/com.muxpod.asr-server.plist
+launchctl load ~/Library/LaunchAgents/io.zigzag.realtime-asr.plist
 ```
 
-Logs land next to `server.py` (`server.stdout.log`, `server.stderr.log`).
+### NVIDIA CUDA
 
-## Session logging
+Install PyTorch for the host CUDA runtime first, then install the CUDA server
+dependencies:
 
-Every WebSocket session and every HTTP batch request is archived for troubleshooting (VAD tuning, speaker-embedding diagnostics, ASR regression tests, record keeping). Layout:
-
-```
-logs/
-├── sessions/
-│   └── 2026-04-19/
-│       └── 143755-ws-a1b2c3d4/
-│           ├── input.flac       # lossless mono 16 kHz, full session audio
-│           └── events.jsonl     # per-event timeline (see below)
-└── http/
-    └── 2026-04-19/
-        ├── 143812-e5f6a7b8.wav  # uploaded audio, original format
-        └── 143812-e5f6a7b8.json # {filename, language, model, text}
+```bash
+cd cuda
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
 ```
 
-Each line in `events.jsonl` is one event with a millisecond timestamp relative to session start:
+Run:
 
-| type | fields | meaning |
+```bash
+ASR_MODEL=Qwen/Qwen3-ASR-1.7B \
+ASR_DEVICE=cuda:0 \
+ASR_DTYPE=bfloat16 \
+ASR_PORT=8766 \
+venv/bin/python server.py
+```
+
+Install as a systemd service:
+
+```bash
+sed \
+  -e "s|__USER__|$USER|g" \
+  -e "s|__GROUP__|$(id -gn)|g" \
+  -e "s|__REPO__|$PWD/..|g" \
+  -e "s|__HF_HOME__|$HOME/.cache/huggingface|g" \
+  -e "s|__LOG_DIR__|$HOME/.realtime-asr|g" \
+  realtime-asr-cuda.service.template \
+  | sudo tee /etc/systemd/system/realtime-asr-cuda.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now realtime-asr-cuda.service
+```
+
+## Configuration
+
+Common:
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `start` | `session_id`, `kind`, `model` | WS connected |
-| `enrolled` | `ref_sec` | First chunk → main-speaker reference |
-| `commit` | `chunk_sec`, `speaker_sim`, `chunk_text`, `committed_text` | Chunk transcribed and folded in |
-| `reject` | `chunk_sec`, `speaker_sim` | Dropped — sim below threshold |
-| `partial` | `text` | UI partial sent |
-| `final` | `text` | Final sent to client |
-| `close` | `audio_bytes`, `duration_ms` | Session done |
+| `ASR_MODEL` | `Qwen/Qwen3-ASR-0.6B` on MLX, `Qwen/Qwen3-ASR-1.7B` on CUDA | Model id. |
+| `ASR_PORT` | `8765` | Bind port. CUDA deployments commonly use `8766`. |
+| `ASR_LOG_DIR` | `logs` | Session archive directory. Set to empty string to disable. |
+| `HF_ENDPOINT` | unset | Hugging Face mirror endpoint. |
 
-Storage cost: FLAC of 16 kHz mono speech is roughly 20 KB per second (~70 MB/hr). Disable logging entirely by setting `ASR_LOG_DIR=""`. Override the directory with `ASR_LOG_DIR=/path/to/archive`.
+Streaming controls:
 
-The `logs/` directory is git-ignored.
+| Variable | Default | Meaning |
+|---|---|---|
+| `ASR_NATIVE_STREAMING` | off for MLX, on only for CUDA vLLM | Use backend-native stream state when supported. |
+| `ASR_BACKEND` | `transformers` on CUDA | CUDA backend: `transformers` or `vllm`. |
+| `ASR_PARTIALS_ENABLED` | off for MLX, on for CUDA transformers | Enable hand-rolled partial inference. |
+| `ASR_FINAL_WAIT_PARTIAL` | off | Whether stop/final waits for an in-flight partial. |
+| `ASR_STREAM_CHUNK_SEC` | `2.0` | Native streaming chunk size. |
 
-## Tuning
-
-Edit constants near the top of `server.py`:
+Speaker filtering:
 
 | Constant | Meaning | Default |
 |---|---|---|
-| `VAD_THRESHOLD` | Silero speech-probability cutoff | `0.5` |
-| `SPEAKER_SIM_THRESHOLD` | Cosine similarity to enrollment | `0.70` |
-| `MIN_EMBED_SEC` | Min chunk length for embedding | `1.0` |
-| `MIN_COMMIT_SEC` | Min chunk length to commit | `1.5` |
-| `COMMIT_SILENCE_WINDOWS` | 160 ms windows of silence to trigger commit | `4` (~640 ms) |
-| `PARTIAL_INTERVAL_SEC` | How often to emit partials | `1.0` |
+| `VAD_THRESHOLD` | Silero speech cutoff | `0.5` |
+| `SPEAKER_SIM_THRESHOLD` | Main-speaker cosine threshold | `0.70` |
+| `MIN_EMBED_SEC` | Min audio for speaker embedding | `1.0` |
+| `MIN_COMMIT_SEC` | Min chunk length to accept | `1.5` |
+| `COMMIT_SILENCE_WINDOWS` | 160 ms silence windows to end a chunk | `4` |
 
-Lower `SPEAKER_SIM_THRESHOLD` if the main speaker sometimes gets rejected; raise it if background speakers leak through.
+## Session Logs
+
+Each WebSocket session is archived as:
+
+```text
+logs/sessions/YYYY-MM-DD/HHMMSS-ws-SESSION/
+├── input.flac
+└── events.jsonl
+```
+
+HTTP uploads are archived under `logs/http/YYYY-MM-DD/`.
+
+These logs are used for replay and regression tests. They are not tracked by
+git.
 
 ## Client
 
-The reference client is the Benchday Flutter app (`lib/services/asr/asr_service.dart`) — WebSocket client with incremental partial/final handling, mic capture at 16 kHz PCM16, and an HTTP-batch fallback for when the WS drops mid-utterance.
+The reusable Dart/Flutter client lives in `client/dart`. Benchday vendors that
+client locally, but the upstream source of truth is this repo:
+
+```yaml
+dependencies:
+  asr_client:
+    git:
+      url: git@github.com:zigzag-tech/realtime-asr.git
+      path: client/dart
+      ref: main
+```

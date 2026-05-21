@@ -1,0 +1,23 @@
+# CUDA ASR server — Qwen3-ASR on NVIDIA GPU via the official qwen-asr package.
+# Target: zz-tower0 (RTX 3090, CUDA 13). PyTorch CUDA wheels must match the
+# local CUDA runtime — install torch separately via the cu12x index.
+
+# ASR model (PyTorch/CUDA) — first-party from the Qwen team.
+qwen-asr
+# Optional native streaming backend: install `qwen-asr[vllm]` and run with
+# ASR_BACKEND=vllm after verifying disk space and GPU memory on the host.
+
+# Audio I/O + numerics
+soundfile
+numpy
+
+# Web framework
+fastapi
+uvicorn
+python-multipart
+websockets
+
+# VAD and speaker embedding
+silero-vad
+Resemblyzer
+onnxruntime-gpu

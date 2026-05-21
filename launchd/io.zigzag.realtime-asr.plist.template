@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.muxpod.asr-server</string>
+    <string>io.zigzag.realtime-asr</string>
 
     <key>ProgramArguments</key>
     <array>

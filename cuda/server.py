@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""
+CUDA Qwen3-ASR server. Same HTTP/WS contract as the MLX server so clients
+are interchangeable. Runs Qwen3-ASR on an NVIDIA GPU via the official
+`qwen-asr` package.
+
+HTTP (batch):
+  POST /v1/audio/transcriptions — OpenAI-compatible, multipart file upload
+
+WebSocket (streaming):
+  WS /ws/transcribe — send binary PCM16 16kHz mono frames, receive JSON:
+    {"partial": "text so far..."}   — interim result while speaking
+    {"final": "complete sentence"}  — after silence detected
+    {"done": true}                  — server closed stream
+
+Health:
+  GET /health
+
+Session logging (VAD/speaker/regression archive) is preserved from the
+MLX server unchanged — per-session input.pcm → FLAC + events.jsonl.
+"""
+
+import os
+import sys
+import io
+import json
+import time
+import uuid
+import struct
+import asyncio
+import tempfile
+import logging
+import wave
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("realtime-asr-cuda")
+
+# 1.7B is the default on this node — the RTX 3090 has enough VRAM and
+# the better-quality 1.7B weights are why we're here instead of on MLX.
+MODEL_NAME = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+DEVICE = os.environ.get("ASR_DEVICE", "cuda:0")
+DTYPE = os.environ.get("ASR_DTYPE", "bfloat16")  # bfloat16 | float16
+ASR_BACKEND = os.environ.get("ASR_BACKEND", "transformers").lower()
+ASR_NATIVE_STREAMING = os.environ.get(
+    "ASR_NATIVE_STREAMING",
+    "1" if ASR_BACKEND == "vllm" else "0",
+).lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_FINAL_WAIT_PARTIAL = os.environ.get("ASR_FINAL_WAIT_PARTIAL", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_PARTIALS_ENABLED = os.environ.get("ASR_PARTIALS_ENABLED", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_STREAM_CHUNK_SEC = float(os.environ.get("ASR_STREAM_CHUNK_SEC", "2.0"))
+FAKE_TRANSCRIBE = os.environ.get("ASR_FAKE_TRANSCRIBE", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+FAKE_TRANSCRIBE_DELAY_SEC = float(os.environ.get("ASR_FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
+_session = None
+_vad_model = None
+_voice_encoder = None
+_transcribe_lock = threading.Lock()
+
+# -------------------------------------------------------------------------
+# Session logging: audio + events are archived per-session for troubleshooting
+# (VAD tuning, speaker-embedding diagnostics, ASR regression tests). Disabled
+# by setting ASR_LOG_DIR="". Raw PCM is written incrementally (crash-safe)
+# and converted to FLAC (lossless, ~60% of WAV size) at session close.
+# -------------------------------------------------------------------------
+_log_dir_env = os.environ.get("ASR_LOG_DIR", "logs")
+if _log_dir_env:
+    _p = Path(_log_dir_env)
+    LOG_DIR = _p if _p.is_absolute() else Path(__file__).parent / _p
+else:
+    LOG_DIR = None
+
+# Silero VAD: chunk must be exactly 512 samples at 16kHz (~32ms).
+VAD_CHUNK_SAMPLES = 512
+VAD_THRESHOLD = 0.5
+# Minimum audio length (sec) before computing a speaker embedding. Embeddings
+# on very short clips are unstable.
+MIN_EMBED_SEC = 1.0
+MIN_EMBED_BYTES_CONST = int(MIN_EMBED_SEC * 16000 * 2)
+# Cosine similarity threshold for "same speaker as reference".
+SPEAKER_SIM_THRESHOLD = 0.70
+ASR_PROTOCOL_VERSION = 1
+ASR_FRAME_MAGIC = b"BASR"
+ASR_FRAME_HEADER_BYTES = 16
+ASR_FRAME_TYPE_AUDIO = 1
+ASR_RESUME_TTL_SEC = float(os.environ.get("ASR_RESUME_TTL_SEC", "300"))
+
+
+class AsrProtocolSession:
+    """In-memory journal for one ASR streaming utterance.
+
+    WebSocket delivery can be choppy; this state lets a reconnect resume at
+    the highest contiguous audio seq and prevents duplicate chunks from being
+    processed twice by the same ASR server process.
+    """
+
+    def __init__(self, session_id: str):
+        now = time.monotonic()
+        self.session_id = session_id
+        self.created = now
+        self.updated = now
+        self.chunks = {}
+        self.highest_contiguous_seq = -1
+        self.gated_audio = bytearray()
+        self.pending_audio = bytearray()
+        self.partial_audio = bytearray()
+        self.raw_partial_audio = bytearray()
+        self.staging = bytearray()
+        self.gate_state = {'silence_run': 0, 'gate_was_open': False}
+        self.reference_embedding = None
+        self.last_partial_text = ""
+        self.raw_signal_bytes = 0
+        self.raw_signal_bytes_at_last_partial = 0
+        self.native_stream_state = None
+        self.final_text = None
+        self.final_stop_id = None
+
+    def accept(self, seq: int, payload: bytes) -> bool:
+        self.updated = time.monotonic()
+        if seq in self.chunks:
+            return False
+        self.chunks[seq] = payload
+        while self.highest_contiguous_seq + 1 in self.chunks:
+            self.highest_contiguous_seq += 1
+        return True
+
+    def raw_audio(self) -> bytes:
+        return b"".join(self.chunks[seq] for seq in sorted(self.chunks))
+
+    def sync_from_connection(
+        self,
+        *,
+        gated_audio: bytearray,
+        pending_audio: bytearray,
+        partial_audio: bytearray,
+        raw_partial_audio: bytearray,
+        staging: bytearray,
+        gate_state: dict,
+        reference_embedding,
+        last_partial_text: str,
+        raw_signal_bytes: int,
+        raw_signal_bytes_at_last_partial: int,
+        native_stream_state,
+    ) -> None:
+        self.updated = time.monotonic()
+        self.gated_audio = bytearray(gated_audio)
+        self.pending_audio = bytearray(pending_audio)
+        self.partial_audio = bytearray(partial_audio)
+        self.raw_partial_audio = bytearray(raw_partial_audio)
+        self.staging = bytearray(staging)
+        self.gate_state = dict(gate_state)
+        self.reference_embedding = reference_embedding
+        self.last_partial_text = last_partial_text
+        self.raw_signal_bytes = raw_signal_bytes
+        self.raw_signal_bytes_at_last_partial = raw_signal_bytes_at_last_partial
+        self.native_stream_state = native_stream_state
+
+
+_protocol_sessions = {}
+
+
+def _prune_protocol_sessions():
+    now = time.monotonic()
+    stale = [
+        sid for sid, sess in _protocol_sessions.items()
+        if now - sess.updated > ASR_RESUME_TTL_SEC
+    ]
+    for sid in stale:
+        _protocol_sessions.pop(sid, None)
+
+
+def _new_protocol_session(session_id: str) -> AsrProtocolSession:
+    _prune_protocol_sessions()
+    sess = AsrProtocolSession(session_id)
+    _protocol_sessions[session_id] = sess
+    return sess
+
+
+def _get_or_create_protocol_session(session_id: str) -> AsrProtocolSession:
+    _prune_protocol_sessions()
+    sess = _protocol_sessions.get(session_id)
+    if sess is None:
+        sess = AsrProtocolSession(session_id)
+        _protocol_sessions[session_id] = sess
+    return sess
+
+
+def _decode_protocol_audio_frame(frame: bytes):
+    if len(frame) < ASR_FRAME_HEADER_BYTES:
+        return None
+    if frame[:4] != ASR_FRAME_MAGIC:
+        return None
+    version = frame[4]
+    frame_type = frame[5]
+    if version != ASR_PROTOCOL_VERSION or frame_type != ASR_FRAME_TYPE_AUDIO:
+        return None
+    seq = int.from_bytes(frame[8:16], "big", signed=False)
+    return seq, frame[ASR_FRAME_HEADER_BYTES:]
+
+
+def _torch_dtype():
+    import torch
+    return {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(
+        DTYPE, torch.bfloat16
+    )
+
+
+def get_session():
+    global _session
+    if _session is None:
+        log.info(
+            "Loading model %s on %s (%s, backend=%s) ...",
+            MODEL_NAME,
+            DEVICE,
+            DTYPE,
+            ASR_BACKEND,
+        )
+        from qwen_asr import Qwen3ASRModel
+        if ASR_BACKEND == "vllm":
+            _session = Qwen3ASRModel.LLM(
+                MODEL_NAME,
+                dtype=DTYPE,
+                max_new_tokens=512,
+            )
+        else:
+            import torch  # noqa: F401 — used indirectly via dtype
+            _session = Qwen3ASRModel.from_pretrained(
+                MODEL_NAME,
+                dtype=_torch_dtype(),
+                device_map=DEVICE,
+                max_new_tokens=512,
+            )
+        log.info("Model loaded successfully.")
+    return _session
+
+
+def get_vad():
+    """Lazy-load Silero VAD (ONNX)."""
+    global _vad_model
+    if _vad_model is None:
+        log.info("Loading Silero VAD ...")
+        from silero_vad import load_silero_vad
+        _vad_model = load_silero_vad(onnx=True)
+        log.info("Silero VAD loaded.")
+    return _vad_model
+
+
+def get_encoder():
+    """Lazy-load Resemblyzer voice encoder."""
+    global _voice_encoder
+    if _voice_encoder is None:
+        log.info("Loading Resemblyzer voice encoder ...")
+        from resemblyzer import VoiceEncoder
+        _voice_encoder = VoiceEncoder(device="cpu", verbose=False)
+        log.info("Voice encoder loaded.")
+    return _voice_encoder
+
+
+def pcm_to_float32(pcm: bytes) -> np.ndarray:
+    """Convert PCM16 bytes to normalized float32 mono samples."""
+    if len(pcm) == 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def pcm_has_signal(pcm: bytes) -> bool:
+    """Cheap energy gate for raw partial scheduling.
+
+    Silero VAD can miss short or quiet tails, so this intentionally uses a
+    low bar. It only suppresses obvious silence from repeatedly triggering
+    expensive raw-buffer transcription.
+    """
+    if len(pcm) < 2:
+        return False
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if samples.size == 0:
+        return False
+    abs_samples = np.abs(samples.astype(np.int32))
+    return float(abs_samples.mean()) >= 80 or int(abs_samples.max()) >= 900
+
+
+def vad_speech_prob(pcm_bytes: bytes) -> float:
+    """Max Silero-VAD speech probability across the chunks in *pcm_bytes*."""
+    if FAKE_TRANSCRIBE:
+        return 1.0 if pcm_has_signal(pcm_bytes) else 0.0
+    samples = pcm_to_float32(pcm_bytes)
+    if len(samples) < VAD_CHUNK_SAMPLES:
+        return 0.0
+    import torch
+    model = get_vad()
+    max_prob = 0.0
+    for i in range(0, len(samples) - VAD_CHUNK_SAMPLES + 1, VAD_CHUNK_SAMPLES):
+        chunk = torch.from_numpy(samples[i:i + VAD_CHUNK_SAMPLES])
+        prob = model(chunk, 16000).item()
+        if prob > max_prob:
+            max_prob = prob
+    return max_prob
+
+
+def compute_embedding(pcm_bytes: bytes) -> Optional[np.ndarray]:
+    """Compute a speaker embedding for the given PCM16 audio.
+
+    Returns None if the clip is too short or preprocessing fails.
+    """
+    if len(pcm_bytes) < MIN_EMBED_BYTES_CONST:
+        return None
+    if FAKE_TRANSCRIBE:
+        return np.ones(256, dtype=np.float32)
+    try:
+        from resemblyzer import preprocess_wav
+        wav = pcm_to_float32(pcm_bytes)
+        wav = preprocess_wav(wav, source_sr=16000)
+        if len(wav) < 16000:  # preprocess_wav trims silence; need >=1s
+            return None
+        enc = get_encoder()
+        return enc.embed_utterance(wav)
+    except Exception:
+        log.exception("Embedding failed")
+        return None
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+class SessionLogger:
+    """Per-connection logger. Writes raw PCM to *input.pcm* as audio arrives
+    (append-only, crash-safe) and events to *events.jsonl*. On close, PCM is
+    transcoded to lossless FLAC and the .pcm file is removed.
+
+    All methods swallow exceptions — logging failures must not break ASR.
+    """
+
+    def __init__(self, kind: str = "ws"):
+        self.enabled = False
+        self.dir: Optional[Path] = None
+        self.pcm_file = None
+        self.events_file = None
+        self.start_monotonic = time.monotonic()
+        self.session_id = uuid.uuid4().hex[:8]
+        self.bytes_written = 0
+        if LOG_DIR is None:
+            return
+        try:
+            now = datetime.now()
+            day_dir = LOG_DIR / "sessions" / now.strftime("%Y-%m-%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            self.dir = day_dir / f"{now.strftime('%H%M%S')}-{kind}-{self.session_id}"
+            self.dir.mkdir()
+            self.pcm_file = open(self.dir / "input.pcm", "wb")
+            self.events_file = open(self.dir / "events.jsonl", "w", encoding="utf-8")
+            self.enabled = True
+            self.event("start", {"session_id": self.session_id, "kind": kind,
+                                 "model": MODEL_NAME, "backend": "cuda"})
+        except Exception:
+            log.exception("SessionLogger init failed; logging disabled for this session")
+            self.enabled = False
+
+    def _ms(self) -> int:
+        return int((time.monotonic() - self.start_monotonic) * 1000)
+
+    def audio(self, data: bytes) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.pcm_file.write(data)
+            self.bytes_written += len(data)
+        except Exception:
+            log.exception("SessionLogger.audio write failed")
+
+    def event(self, type_: str, data: Optional[dict] = None) -> None:
+        if not self.enabled:
+            return
+        try:
+            ev = {"t_ms": self._ms(), "type": type_}
+            if data:
+                ev.update(data)
+            self.events_file.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            self.events_file.flush()
+        except Exception:
+            log.exception("SessionLogger.event write failed")
+
+    def close(self) -> None:
+        """Close handles and transcode PCM → FLAC. Safe to call once."""
+        if not self.enabled:
+            return
+        self.enabled = False
+        self.event("close", {"audio_bytes": self.bytes_written,
+                             "duration_ms": self._ms()})
+        try:
+            if self.pcm_file:
+                self.pcm_file.close()
+            if self.events_file:
+                self.events_file.close()
+        except Exception:
+            log.exception("SessionLogger close failed")
+        # Transcode PCM → FLAC (lossless, ~40% smaller than WAV).
+        pcm_path = self.dir / "input.pcm"
+        flac_path = self.dir / "input.flac"
+        try:
+            if pcm_path.exists() and pcm_path.stat().st_size > 0:
+                import soundfile as sf
+                pcm = np.fromfile(str(pcm_path), dtype=np.int16)
+                sf.write(str(flac_path), pcm, 16000,
+                         format="FLAC", subtype="PCM_16")
+                pcm_path.unlink()
+                log.info("Session log: %s (%.2fs audio)", self.dir,
+                         len(pcm) / 16000.0)
+            elif pcm_path.exists():
+                pcm_path.unlink()  # empty file — drop it
+        except Exception:
+            log.exception("FLAC transcode failed; keeping .pcm")
+
+
+def _log_http_request(audio_bytes: bytes, filename: str, text: str,
+                       language: Optional[str]) -> None:
+    """Archive an HTTP batch request + its transcription."""
+    if LOG_DIR is None:
+        return
+    try:
+        now = datetime.now()
+        day_dir = LOG_DIR / "http" / now.strftime("%Y-%m-%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        rid = uuid.uuid4().hex[:8]
+        prefix = day_dir / f"{now.strftime('%H%M%S')}-{rid}"
+        suffix = Path(filename).suffix if filename else ".bin"
+        (prefix.with_suffix(suffix)).write_bytes(audio_bytes)
+        meta = {"timestamp": now.isoformat(timespec="seconds"),
+                "filename": filename,
+                "language": language,
+                "model": MODEL_NAME,
+                "backend": "cuda",
+                "text": text}
+        (prefix.with_suffix(".json")).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        log.exception("HTTP request logging failed")
+
+
+def pcm_to_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw PCM16 mono data in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    return buf.getvalue()
+
+
+def rms_energy(pcm_data: bytes) -> float:
+    """Calculate RMS energy of PCM16 data."""
+    n_samples = len(pcm_data) // 2
+    if n_samples == 0:
+        return 0.0
+    samples = struct.unpack(f"<{n_samples}h", pcm_data[:n_samples * 2])
+    return (sum(s * s for s in samples) / n_samples) ** 0.5
+
+
+def native_streaming_available() -> bool:
+    if not ASR_NATIVE_STREAMING or FAKE_TRANSCRIBE:
+        return False
+    session = get_session()
+    return all(
+        hasattr(session, name)
+        for name in (
+            "init_streaming_state",
+            "streaming_transcribe",
+            "finish_streaming_transcribe",
+        )
+    ) and getattr(session, "backend", None) == "vllm"
+
+
+def init_native_stream(context: str):
+    session = get_session()
+    return session.init_streaming_state(
+        context=context or "",
+        chunk_size_sec=ASR_STREAM_CHUNK_SEC,
+    )
+
+
+async def feed_native_stream(state, pcm_data: bytes) -> str:
+    if state is None or not pcm_data:
+        return ""
+    pcm = pcm_to_float32(pcm_data)
+    if pcm.size == 0:
+        return getattr(state, "text", "") or ""
+    loop = asyncio.get_event_loop()
+
+    def run_feed():
+        with _transcribe_lock:
+            return get_session().streaming_transcribe(pcm, state)
+
+    await loop.run_in_executor(None, run_feed)
+    return (getattr(state, "text", "") or "").strip()
+
+
+async def finish_native_stream(state) -> str:
+    if state is None:
+        return ""
+    loop = asyncio.get_event_loop()
+
+    def run_finish():
+        with _transcribe_lock:
+            return get_session().finish_streaming_transcribe(state)
+
+    await loop.run_in_executor(None, run_finish)
+    return (getattr(state, "text", "") or "").strip()
+
+
+def _flatten_result_text(result) -> str:
+    """qwen-asr `.transcribe()` returns a list of result objects (one per
+    internal 30s chunk). Concatenate `.text` across them, preserving order.
+    MLX Session.transcribe returned a single object; this helper normalizes
+    both shapes so the WS/HTTP handlers don't care."""
+    if result is None:
+        return ""
+    if isinstance(result, list):
+        parts = [getattr(r, "text", "") or "" for r in result]
+        return "".join(parts).strip()
+    return (getattr(result, "text", "") or "").strip()
+
+
+def _flatten_result_language(result) -> Optional[str]:
+    if result is None:
+        return None
+    if isinstance(result, list):
+        for r in result:
+            lang = getattr(r, "language", None)
+            if lang:
+                return lang
+        return None
+    return getattr(result, "language", None)
+
+
+# ---------------------------------------------------------------------------
+app = FastAPI(title="realtime-asr (CUDA)", version="2.0.0")
+
+
+@app.on_event("startup")
+async def startup_event():
+    if FAKE_TRANSCRIBE:
+        log.info("ASR_FAKE_TRANSCRIBE enabled; skipping model/VAD/encoder preload.")
+        return
+    log.info("Pre-loading ASR model at startup...")
+    get_session()
+    get_vad()
+    get_encoder()
+    log.info("Server ready.")
+
+
+@app.get("/health")
+async def health():
+    gpu = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            idx = 0
+            gpu = {
+                "device": torch.cuda.get_device_name(idx),
+                "mem_allocated_mb": round(torch.cuda.memory_allocated(idx) / 1e6, 1),
+                "mem_reserved_mb": round(torch.cuda.memory_reserved(idx) / 1e6, 1),
+            }
+    except Exception:
+        pass
+    return {"status": "ok", "model": MODEL_NAME, "backend": "cuda",
+            "dtype": DTYPE, "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu}
+
+
+# ---------------------------------------------------------------------------
+# HTTP batch endpoint
+# ---------------------------------------------------------------------------
+@app.post("/v1/audio/transcriptions")
+async def transcribe(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    context: Optional[str] = Form(None),
+    response_format: Optional[str] = Form("json"),
+):
+    t0 = time.monotonic()
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+
+        session = get_session()
+        kwargs = {"audio": tmp.name}
+        if language:
+            kwargs["language"] = language
+        if context:
+            kwargs["context"] = context
+        loop = asyncio.get_event_loop()
+        def run_transcribe():
+            with _transcribe_lock:
+                return session.transcribe(**kwargs)
+
+        result = await loop.run_in_executor(None, run_transcribe)
+        text = _flatten_result_text(result)
+        lang = _flatten_result_language(result)
+
+        elapsed = time.monotonic() - t0
+        log.info("Transcribed in %.2fs: %s", elapsed, text[:80])
+        _log_http_request(content, file.filename or "upload", text, language)
+
+        fmt = (response_format or "json").lower()
+        if fmt == "text":
+            return PlainTextResponse(text)
+        elif fmt == "verbose_json":
+            return JSONResponse({
+                "text": text,
+                "language": lang,
+                "duration": elapsed,
+            })
+        else:
+            return JSONResponse({"text": text})
+    except Exception as e:
+        log.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# WebSocket streaming endpoint
+# ---------------------------------------------------------------------------
+SAMPLE_RATE = 16000
+BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
+
+# Partial interval: how often to emit a live partial.
+PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
+
+# Minimum new non-silent audio before scheduling another partial. This keeps
+# tiny audio dribbles from causing an expensive reparse of the same tail.
+PARTIAL_MIN_DELTA_SEC = float(os.environ.get("ASR_PARTIAL_MIN_DELTA_SEC", "0.5"))
+PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
+
+# Sliding window for live partials.  The model re-transcribes the last N
+# seconds of audio on every partial tick.  20 s covers almost all natural
+# sentences; the final pass still transcribes the full utterance.
+PARTIAL_WINDOW_SEC = float(os.environ.get("ASR_PARTIAL_WINDOW_SEC", "20.0"))
+PARTIAL_WINDOW_BYTES = int(PARTIAL_WINDOW_SEC * BYTES_PER_SEC)
+
+# VAD windowing: 160ms analysis windows (5 Silero chunks each).
+GATE_WINDOW_SEC = 0.16
+GATE_WINDOW_BYTES = int(GATE_WINDOW_SEC * BYTES_PER_SEC)
+
+# Incremental commit: after this many consecutive non-speech windows (and
+# at least MIN_COMMIT_SEC of pending speech), run speaker check and
+# transcribe the chunk once. Live partials are coalesced separately and never
+# run more than one model pass at a time.
+COMMIT_SILENCE_WINDOWS = 4       # ~640ms of silence marks a chunk boundary
+MIN_COMMIT_SEC = 1.5             # don't commit chunks shorter than this
+MIN_COMMIT_BYTES = int(MIN_COMMIT_SEC * BYTES_PER_SEC)
+
+
+def _process_staged_audio(staging, prev_window, gate_state):
+    """Split *staging* into fixed-size windows and classify each with
+    Silero VAD. Emits events:
+      ('audio', bytes) — a window containing speech
+      ('boundary',)    — silence run long enough to mark a chunk boundary
+
+    A one-window attack buffer (prev_window) is prepended when speech
+    resumes so onsets aren't clipped.
+
+    gate_state: dict with 'silence_run' (int), 'gate_was_open' (bool),
+    tracked across calls so boundaries can span receive iterations.
+    """
+    events = []
+    while len(staging) >= GATE_WINDOW_BYTES:
+        window = bytes(staging[:GATE_WINDOW_BYTES])
+        del staging[:GATE_WINDOW_BYTES]
+
+        is_speech = vad_speech_prob(window) >= VAD_THRESHOLD
+
+        if is_speech:
+            if prev_window:
+                events.append(('audio', prev_window[0]))
+                prev_window.clear()
+            events.append(('audio', window))
+            gate_state['silence_run'] = 0
+            gate_state['gate_was_open'] = True
+        else:
+            prev_window.clear()
+            prev_window.append(window)
+            if gate_state.get('gate_was_open'):
+                gate_state['silence_run'] += 1
+                if gate_state['silence_run'] >= COMMIT_SILENCE_WINDOWS:
+                    events.append(('boundary',))
+                    gate_state['gate_was_open'] = False
+                    gate_state['silence_run'] = 0
+
+    return events
+
+
+@app.websocket("/ws/transcribe")
+async def ws_transcribe(ws: WebSocket):
+    await ws.accept()
+    log.info("WebSocket client connected")
+
+    # Tail-first streaming transcription.
+    #
+    # We keep a single growing audio buffer of accepted primary-speaker
+    # speech (`gated_audio`) for the final pass, but live partials only
+    # transcribe the recent speech tail. Re-transcribing the whole utterance
+    # on each tick makes the last few spoken words lag further behind as
+    # the utterance grows.
+    #
+    # `pending_audio` is still the current silence-bounded chunk — we use
+    # it for speaker-enrollment/rejection at each boundary. Once a chunk
+    # is accepted (or is the enrollment chunk), its bytes are appended to
+    # `gated_audio` for the final pass and cleared; rejected chunks are
+    # discarded.
+    gated_audio = bytearray()
+    pending_audio = bytearray()
+    raw_audio = bytearray()      # full mic stream, used when VAD is too strict
+    raw_partial_audio = bytearray()
+    partial_audio = bytearray()  # all audio for partial transcription (never cleared)
+    staging = bytearray()
+    prev_window = []
+    gate_state = {'silence_run': 0, 'gate_was_open': False}
+    reference_embedding = None
+    last_partial_time = time.monotonic()
+    last_partial_text = ""
+    raw_signal_bytes = 0
+    raw_signal_bytes_at_last_partial = 0
+    native_stream_state = None
+    partial_task = None
+    closing = False
+    loop = asyncio.get_event_loop()
+    slog = SessionLogger("ws")
+    protocol_session: Optional[AsrProtocolSession] = None
+    protocol_session_id = ""
+    protocol_stop_id = ""
+    send_lock = asyncio.Lock()
+
+    # ASR context hint (distilled terminal vocabulary, etc.).  Received as
+    # part of the required protocol start/resume message before audio frames.
+    asr_context = ""
+
+    async def send_json(payload: dict) -> None:
+        async with send_lock:
+            await ws.send_json(payload)
+
+    def sync_protocol_session() -> None:
+        if protocol_session is None:
+            return
+        protocol_session.sync_from_connection(
+            gated_audio=gated_audio,
+            pending_audio=pending_audio,
+            partial_audio=partial_audio,
+            raw_partial_audio=raw_partial_audio,
+            staging=staging,
+            gate_state=gate_state,
+            reference_embedding=reference_embedding,
+            last_partial_text=last_partial_text,
+            raw_signal_bytes=raw_signal_bytes,
+            raw_signal_bytes_at_last_partial=raw_signal_bytes_at_last_partial,
+            native_stream_state=native_stream_state,
+        )
+
+    def hydrate_from_protocol_session(sess: AsrProtocolSession) -> None:
+        nonlocal gated_audio, pending_audio, raw_audio, raw_partial_audio
+        nonlocal partial_audio, staging, gate_state, reference_embedding
+        nonlocal last_partial_text, raw_signal_bytes
+        nonlocal raw_signal_bytes_at_last_partial, native_stream_state
+        gated_audio = bytearray(sess.gated_audio)
+        pending_audio = bytearray(sess.pending_audio)
+        raw_audio = bytearray(sess.raw_audio())
+        raw_partial_audio = bytearray(sess.raw_partial_audio)
+        partial_audio = bytearray(sess.partial_audio)
+        staging = bytearray(sess.staging)
+        gate_state = dict(sess.gate_state)
+        reference_embedding = sess.reference_embedding
+        last_partial_text = sess.last_partial_text
+        raw_signal_bytes = sess.raw_signal_bytes
+        raw_signal_bytes_at_last_partial = sess.raw_signal_bytes_at_last_partial
+        native_stream_state = sess.native_stream_state
+
+    async def send_protocol_ack() -> None:
+        if protocol_session is None:
+            return
+        await send_json({
+            "type": "ack",
+            "protocol": ASR_PROTOCOL_VERSION,
+            "sessionId": protocol_session.session_id,
+            "ackSeq": protocol_session.highest_contiguous_seq,
+        })
+
+    async def emit_partial(text: str, audio_sec: Optional[float] = None) -> None:
+        nonlocal last_partial_text
+        if closing or not text or text == last_partial_text:
+            return
+        delta = None
+        if text.startswith(last_partial_text):
+            delta = text[len(last_partial_text):]
+        payload = {
+            "type": "partial",
+            "sessionId": protocol_session_id,
+            "partial": text,
+        }
+        if delta:
+            payload["delta"] = delta
+        await send_json(payload)
+        last_partial_text = text
+        sync_protocol_session()
+        log.info("Partial: %s", text[:80])
+        ev = {"text": text}
+        if audio_sec is not None:
+            ev["audio_sec"] = audio_sec
+        slog.event("partial", ev)
+
+    def using_native_stream() -> bool:
+        return native_stream_state is not None
+
+    async def feed_native_partial(audio_bytes: bytes) -> None:
+        if not using_native_stream():
+            return
+        text = await feed_native_stream(native_stream_state, audio_bytes)
+        await emit_partial(text, len(raw_audio) / BYTES_PER_SEC)
+
+    async def apply_events(events):
+        nonlocal reference_embedding
+        for ev in events:
+            if ev[0] == 'audio':
+                pending_audio.extend(ev[1])
+                partial_audio.extend(ev[1])
+            elif ev[0] == 'boundary':
+                if len(pending_audio) < MIN_COMMIT_BYTES:
+                    slog.event("boundary_short", {
+                        "pending_bytes": len(pending_audio)})
+                    pending_audio.clear()
+                    continue
+
+                # Speaker check (off-thread — embedding takes ~30-50ms).
+                chunk_bytes = bytes(pending_audio)
+                embedding = await loop.run_in_executor(
+                    None, compute_embedding, chunk_bytes)
+
+                accept = True
+                sim_val = None
+                if embedding is None:
+                    slog.event("embedding_skipped",
+                               {"chunk_sec": len(chunk_bytes) / BYTES_PER_SEC})
+                elif reference_embedding is None:
+                    reference_embedding = embedding
+                    log.info(
+                        "Enrolled main speaker (%.2fs of speech)",
+                        len(chunk_bytes) / BYTES_PER_SEC,
+                    )
+                    slog.event("enrolled",
+                               {"ref_sec": len(chunk_bytes) / BYTES_PER_SEC})
+                else:
+                    sim_val = cosine_sim(embedding, reference_embedding)
+                    if sim_val >= SPEAKER_SIM_THRESHOLD:
+                        log.info("Chunk accepted (speaker sim=%.2f)", sim_val)
+                    else:
+                        accept = False
+                        log.info("Chunk rejected (speaker sim=%.2f)", sim_val)
+
+                if accept:
+                    gated_audio.extend(pending_audio)
+                    slog.event("chunk_accepted", {
+                        "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                        "speaker_sim": sim_val,
+                        "gated_sec": len(gated_audio) / BYTES_PER_SEC,
+                    })
+                else:
+                    slog.event("reject", {
+                        "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                        "speaker_sim": sim_val})
+
+                pending_audio.clear()
+
+    def partial_snapshot() -> bytes:
+        buf = raw_partial_audio if raw_partial_audio else partial_audio
+        if len(buf) > PARTIAL_WINDOW_BYTES:
+            return bytes(buf[-PARTIAL_WINDOW_BYTES:])
+        return bytes(buf)
+
+    async def transcribe_partial(buf: bytes) -> str:
+        """Transcribe the last N seconds of audio for live partials.
+        Uses a sliding window so long utterances don't blow up.
+        Returns stripped text ("" if empty/failed)."""
+        if len(buf) < int(BYTES_PER_SEC * 0.3):
+            return ""
+        text = (
+            await _transcribe_buffer(bytearray(buf), context=asr_context)
+            or ""
+        ).strip()
+        return text
+
+    async def run_partial(buf: bytes, signal_snapshot: int) -> None:
+        nonlocal last_partial_time, last_partial_text
+        nonlocal raw_signal_bytes_at_last_partial
+        audio_sec = len(buf) / BYTES_PER_SEC
+        slog.event("partial_begin", {
+            "audio_sec": audio_sec,
+            "signal_bytes": signal_snapshot,
+        })
+        try:
+            text = await transcribe_partial(buf)
+            if closing:
+                slog.event("partial_suppressed", {"reason": "closing"})
+                return
+            await emit_partial(text, audio_sec)
+        finally:
+            last_partial_time = time.monotonic()
+            raw_signal_bytes_at_last_partial = max(
+                raw_signal_bytes_at_last_partial,
+                signal_snapshot,
+            )
+            slog.event("partial_done", {
+                "audio_sec": audio_sec,
+                "signal_bytes": signal_snapshot,
+            })
+
+    def observe_partial_task(task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Partial transcription task failed")
+            slog.event("partial_error")
+
+    async def maybe_send_partial() -> None:
+        nonlocal partial_task
+
+        if not ASR_PARTIALS_ENABLED:
+            return
+        if closing:
+            return
+        if partial_task is not None and not partial_task.done():
+            return
+        now = time.monotonic()
+        new_signal_bytes = raw_signal_bytes - raw_signal_bytes_at_last_partial
+        if new_signal_bytes < PARTIAL_MIN_DELTA_BYTES:
+            return
+
+        if now - last_partial_time < PARTIAL_INTERVAL_SEC:
+            return
+
+        buf = partial_snapshot()
+        if len(buf) < int(BYTES_PER_SEC * 0.3):
+            return
+
+        signal_snapshot = raw_signal_bytes
+        partial_task = asyncio.create_task(run_partial(buf, signal_snapshot))
+        partial_task.add_done_callback(observe_partial_task)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive(), timeout=0.1)
+            except asyncio.TimeoutError:
+                if not using_native_stream():
+                    events = _process_staged_audio(staging, prev_window, gate_state)
+                    await apply_events(events)
+                    await maybe_send_partial()
+                continue
+            except RuntimeError as e:
+                if "disconnect message" in str(e):
+                    raise WebSocketDisconnect
+                raise
+
+            if "bytes" in data:
+                if protocol_session is None:
+                    await send_json({
+                        "type": "error",
+                        "error": "ASR protocol start required before audio",
+                    })
+                    slog.event("protocol_error", {"reason": "audio_before_start"})
+                    break
+                decoded = _decode_protocol_audio_frame(data["bytes"])
+                if decoded is None:
+                    await send_json({
+                        "type": "error",
+                        "error": "unframed ASR audio is not accepted",
+                    })
+                    slog.event("protocol_error", {"reason": "unframed_audio"})
+                    break
+                seq, audio_bytes = decoded
+                accepted = protocol_session.accept(seq, audio_bytes)
+                await send_protocol_ack()
+                if not accepted:
+                    slog.event("duplicate_audio", {
+                        "session_id": protocol_session.session_id,
+                        "seq": seq,
+                        "ack_seq": protocol_session.highest_contiguous_seq,
+                    })
+                    continue
+                slog.audio(audio_bytes)
+                raw_audio.extend(audio_bytes)
+                if pcm_has_signal(audio_bytes):
+                    raw_partial_audio.extend(audio_bytes)
+                    raw_signal_bytes += len(audio_bytes)
+                staging.extend(audio_bytes)
+                events = _process_staged_audio(staging, prev_window, gate_state)
+                await apply_events(events)
+                sync_protocol_session()
+                if using_native_stream():
+                    await feed_native_partial(audio_bytes)
+                else:
+                    await maybe_send_partial()
+            elif "text" in data:
+                msg = json.loads(data["text"])
+                msg_type = msg.get("type")
+                if msg_type in {"start", "resume"}:
+                    if msg.get("protocol") != ASR_PROTOCOL_VERSION:
+                        await send_json({
+                            "type": "error",
+                            "error": "unsupported ASR protocol version",
+                        })
+                        slog.event("protocol_error", {
+                            "reason": "unsupported_version",
+                            "protocol": msg.get("protocol"),
+                        })
+                        break
+                    protocol_session_id = str(msg.get("sessionId") or "")
+                    if not protocol_session_id:
+                        await send_json({
+                            "type": "error",
+                            "error": "sessionId is required",
+                        })
+                        slog.event("protocol_error", {"reason": "missing_session_id"})
+                        break
+                    protocol_session = (
+                        _new_protocol_session(protocol_session_id)
+                        if msg_type == "start"
+                        else _get_or_create_protocol_session(protocol_session_id)
+                    )
+                    hydrate_from_protocol_session(protocol_session)
+                    asr_context = msg.get("context") or ""
+                    if native_streaming_available() and native_stream_state is None:
+                        native_stream_state = init_native_stream(asr_context)
+                        sync_protocol_session()
+                        slog.event("native_stream_started", {
+                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
+                            "backend": ASR_BACKEND,
+                        })
+                    slog.event("protocol_started", {
+                        "session_id": protocol_session_id,
+                        "resume": msg_type == "resume",
+                        "ack_seq": protocol_session.highest_contiguous_seq,
+                        "context_len": len(asr_context),
+                    })
+                    await send_json({
+                        "type": "resumed" if msg_type == "resume" else "started",
+                        "protocol": ASR_PROTOCOL_VERSION,
+                        "sessionId": protocol_session_id,
+                        "ackSeq": protocol_session.highest_contiguous_seq,
+                    })
+                    continue
+                if msg_type == "stop":
+                    if protocol_session is None:
+                        await send_json({
+                            "type": "error",
+                            "error": "ASR protocol stop before start",
+                        })
+                        slog.event("protocol_error", {"reason": "stop_before_start"})
+                        break
+                    closing = True
+                    protocol_stop_id = str(msg.get("stopId") or "")
+                    slog.event("stop_requested", {
+                        "session_id": protocol_session.session_id,
+                        "stop_id": protocol_stop_id,
+                        "ack_seq": protocol_session.highest_contiguous_seq,
+                    })
+                    if (
+                        protocol_session.final_text is not None
+                        and protocol_session.final_stop_id == protocol_stop_id
+                    ):
+                        await send_json({
+                            "type": "final",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                            "text": protocol_session.final_text,
+                        })
+                        await send_json({
+                            "type": "done",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                        })
+                        break
+                    if using_native_stream():
+                        final_text = await finish_native_stream(native_stream_state)
+                        if not final_text and last_partial_text:
+                            final_text = last_partial_text
+                            slog.event("final_from_last_partial", {"text": final_text})
+                        if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
+                            final_text = (
+                                await _transcribe_buffer(raw_audio, context=asr_context)
+                                or ""
+                            ).strip()
+                            if final_text:
+                                slog.event("final_raw_fallback", {"text": final_text})
+                        slog.event("final", {
+                            "text": final_text,
+                            "native_stream": True,
+                        })
+                        protocol_session.final_text = final_text
+                        protocol_session.final_stop_id = protocol_stop_id
+                        protocol_session.updated = time.monotonic()
+                        await send_json({
+                            "type": "final",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                            "text": final_text,
+                        })
+                        if final_text:
+                            log.info("Final (native stop): %s", final_text[:80])
+                        slog.event("done", {"stop_id": protocol_stop_id})
+                        await send_json({
+                            "type": "done",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                        })
+                        await asyncio.sleep(0.05)
+                        break
+                    events = _process_staged_audio(staging, prev_window, gate_state)
+                    await apply_events(events)
+                    if partial_task is not None and not partial_task.done():
+                        if ASR_FINAL_WAIT_PARTIAL:
+                            slog.event("final_wait_partial")
+                            try:
+                                await partial_task
+                            except Exception:
+                                log.exception("Partial transcription failed before final")
+                        else:
+                            slog.event("final_skip_partial")
+
+                    # Tail: if pending has enough speech, speaker-check
+                    # and (if accepted) roll it into gated_audio before
+                    # the final transcription pass.
+                    if len(pending_audio) > BYTES_PER_SEC * 0.3:
+                        chunk_bytes = bytes(pending_audio)
+                        accept = True
+                        sim_val = None
+                        if reference_embedding is not None:
+                            emb = await loop.run_in_executor(
+                                None, compute_embedding, chunk_bytes)
+                            if emb is not None:
+                                sim_val = cosine_sim(emb, reference_embedding)
+                                if sim_val < SPEAKER_SIM_THRESHOLD:
+                                    accept = False
+                                    log.info(
+                                        "Final tail rejected (speaker sim=%.2f)",
+                                        sim_val,
+                                    )
+                        if accept:
+                            gated_audio.extend(pending_audio)
+                            sync_protocol_session()
+                            slog.event("final_tail_accepted", {
+                                "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                                "speaker_sim": sim_val})
+                        else:
+                            slog.event("final_tail_reject", {
+                                "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
+                                "speaker_sim": sim_val})
+                        pending_audio.clear()
+
+                    final_text = ""
+                    # Fast path: if the utterance fits in the partial window,
+                    # the last partial already transcribed the same audio.
+                    # Skip the redundant full-buffer transcription.
+                    if (
+                        len(gated_audio) >= int(BYTES_PER_SEC * 0.3)
+                        and len(gated_audio) <= PARTIAL_WINDOW_BYTES
+                        and last_partial_text
+                    ):
+                        final_text = last_partial_text
+                        slog.event("final_from_last_partial_fastpath", {"text": final_text})
+                    elif len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
+                        final_text = (await _transcribe_buffer(gated_audio, context=asr_context) or "").strip()
+                    if not final_text and last_partial_text:
+                        final_text = last_partial_text
+                        slog.event("final_from_last_partial", {"text": final_text})
+                    if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
+                        final_text = (
+                            await _transcribe_buffer(raw_audio, context=asr_context)
+                            or ""
+                        ).strip()
+                        if final_text:
+                            slog.event("final_raw_fallback", {"text": final_text})
+                    slog.event("final", {"text": final_text})
+                    protocol_session.final_text = final_text
+                    protocol_session.final_stop_id = protocol_stop_id
+                    protocol_session.updated = time.monotonic()
+                    await send_json({
+                        "type": "final",
+                        "sessionId": protocol_session.session_id,
+                        "stopId": protocol_stop_id,
+                        "text": final_text,
+                    })
+                    if final_text:
+                        log.info("Final (stop): %s", final_text[:80])
+                    slog.event("done", {"stop_id": protocol_stop_id})
+                    await send_json({
+                        "type": "done",
+                        "sessionId": protocol_session.session_id,
+                        "stopId": protocol_stop_id,
+                    })
+                    await asyncio.sleep(0.05)
+                    break
+                await send_json({
+                    "type": "error",
+                    "error": "unsupported ASR protocol message",
+                })
+                slog.event("protocol_error", {
+                    "reason": "unsupported_message",
+                    "message_type": msg_type,
+                })
+                break
+
+    except WebSocketDisconnect:
+        log.info("WebSocket client disconnected")
+        slog.event("disconnect", {
+            "session_id": protocol_session_id,
+            "ack_seq": (
+                protocol_session.highest_contiguous_seq
+                if protocol_session is not None else None
+            ),
+        })
+    except Exception as e:
+        log.exception("WebSocket error: %s", e)
+        slog.event("error", {"message": str(e)})
+        try:
+            await send_json({"error": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            closing = True
+            await loop.run_in_executor(None, slog.close)
+        except Exception:
+            log.exception("Session logger close failed")
+
+
+async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
+    """Transcribe the accumulated PCM16 buffer. Passes a (np.float32, 16000)
+    tuple directly to qwen-asr so we skip a WAV write/read on the partial hot
+    path — meaningful at 1 partial/second."""
+    if len(audio_buffer) == 0:
+        return ""
+    if FAKE_TRANSCRIBE:
+        if FAKE_TRANSCRIBE_DELAY_SEC > 0:
+            await asyncio.sleep(FAKE_TRANSCRIBE_DELAY_SEC)
+        audio_sec = len(audio_buffer) / BYTES_PER_SEC
+        buckets = max(1, int(audio_sec / 0.8))
+        return " ".join(f"fake{idx + 1}" for idx in range(buckets))
+    wav = pcm_to_float32(bytes(audio_buffer))
+    try:
+        session = get_session()
+        loop = asyncio.get_event_loop()
+        kwargs = {"audio": (wav, SAMPLE_RATE)}
+        if context:
+            kwargs["context"] = context
+        def run_transcribe():
+            with _transcribe_lock:
+                return session.transcribe(**kwargs)
+
+        result = await loop.run_in_executor(None, run_transcribe)
+        return _flatten_result_text(result)
+    except Exception:
+        log.exception("Transcription error")
+        return ""
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("ASR_PORT", "8765")),
+        log_level="info",
+    )
