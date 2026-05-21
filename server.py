@@ -56,6 +56,24 @@ _transcribe_lock = threading.Lock()
 # Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
 # cache after every transcription so memory stays bounded.
 ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
+ASR_NATIVE_STREAMING = os.environ.get("ASR_NATIVE_STREAMING", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_FINAL_WAIT_PARTIAL = os.environ.get("ASR_FINAL_WAIT_PARTIAL", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_PARTIALS_ENABLED = os.environ.get("ASR_PARTIALS_ENABLED", "0").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ASR_STREAM_CHUNK_SEC = float(os.environ.get("ASR_STREAM_CHUNK_SEC", "2.0"))
+ASR_STREAM_MAX_CONTEXT_SEC = float(os.environ.get("ASR_STREAM_MAX_CONTEXT_SEC", "30.0"))
+ASR_STREAM_FINALIZATION_MODE = os.environ.get("ASR_STREAM_FINALIZATION_MODE", "latency")
 
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
@@ -103,12 +121,10 @@ class AsrProtocolSession:
         self.staging = bytearray()
         self.gate_state = {'silence_run': 0, 'gate_was_open': False}
         self.reference_embedding = None
-        self.committed_text = ""
         self.last_partial_text = ""
         self.raw_signal_bytes = 0
         self.raw_signal_bytes_at_last_partial = 0
-        self.gated_len_at_last_partial = 0
-        self.pending_len_at_last_partial = 0
+        self.native_stream_state = None
         self.final_text = None
         self.final_stop_id = None
 
@@ -134,12 +150,10 @@ class AsrProtocolSession:
         staging: bytearray,
         gate_state: dict,
         reference_embedding,
-        committed_text: str,
         last_partial_text: str,
         raw_signal_bytes: int,
         raw_signal_bytes_at_last_partial: int,
-        gated_len_at_last_partial: int,
-        pending_len_at_last_partial: int,
+        native_stream_state,
     ) -> None:
         self.updated = time.monotonic()
         self.gated_audio = bytearray(gated_audio)
@@ -149,12 +163,10 @@ class AsrProtocolSession:
         self.staging = bytearray(staging)
         self.gate_state = dict(gate_state)
         self.reference_embedding = reference_embedding
-        self.committed_text = committed_text
         self.last_partial_text = last_partial_text
         self.raw_signal_bytes = raw_signal_bytes
         self.raw_signal_bytes_at_last_partial = raw_signal_bytes_at_last_partial
-        self.gated_len_at_last_partial = gated_len_at_last_partial
-        self.pending_len_at_last_partial = pending_len_at_last_partial
+        self.native_stream_state = native_stream_state
 
 
 _protocol_sessions = {}
@@ -436,6 +448,64 @@ def rms_energy(pcm_data: bytes) -> float:
     return (sum(s * s for s in samples) / n_samples) ** 0.5
 
 
+def pcm16_to_float32(pcm_data: bytes) -> np.ndarray:
+    """Convert raw PCM16 mono bytes into the native streaming API format."""
+    if not pcm_data:
+        return np.zeros(0, dtype=np.float32)
+    return np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def native_streaming_available() -> bool:
+    if not ASR_NATIVE_STREAMING:
+        return False
+    session = get_session()
+    return all(
+        hasattr(session, name)
+        for name in ("init_streaming", "feed_audio", "finish_streaming")
+    )
+
+
+def init_native_stream(context: str):
+    session = get_session()
+    return session.init_streaming(
+        context=context or "",
+        chunk_size_sec=ASR_STREAM_CHUNK_SEC,
+        max_context_sec=ASR_STREAM_MAX_CONTEXT_SEC,
+        max_new_tokens=ASR_MAX_NEW_TOKENS,
+        finalization_mode=ASR_STREAM_FINALIZATION_MODE,
+    )
+
+
+async def feed_native_stream(state, pcm_data: bytes) -> str:
+    if state is None or not pcm_data:
+        return ""
+    pcm = pcm16_to_float32(pcm_data)
+    if pcm.size == 0:
+        return getattr(state, "text", "") or ""
+    loop = asyncio.get_event_loop()
+
+    def run_feed():
+        with _transcribe_lock:
+            return get_session().feed_audio(pcm, state)
+
+    await loop.run_in_executor(None, run_feed)
+    return (getattr(state, "text", "") or "").strip()
+
+
+async def finish_native_stream(state) -> str:
+    if state is None:
+        return ""
+    loop = asyncio.get_event_loop()
+
+    def run_finish():
+        with _transcribe_lock:
+            return get_session().finish_streaming(state)
+
+    await loop.run_in_executor(None, run_finish)
+    _clear_mlx_cache()
+    return (getattr(state, "text", "") or "").strip()
+
+
 # ---------------------------------------------------------------------------
 app = FastAPI(title="MuxPod ASR Server", version="2.0.0")
 
@@ -518,6 +588,11 @@ BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 
 # Partial interval: how often to emit a live partial.
 PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
+
+# Minimum new non-silent audio before scheduling another partial. This keeps
+# tiny audio dribbles from causing an expensive reparse of the same tail.
+PARTIAL_MIN_DELTA_SEC = float(os.environ.get("ASR_PARTIAL_MIN_DELTA_SEC", "0.5"))
+PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
@@ -609,14 +684,13 @@ async def ws_transcribe(ws: WebSocket):
     # `pending_audio` is still the current silence-bounded chunk — we use
     # it for speaker-enrollment/rejection at each boundary. Once a chunk
     # is accepted (or is the enrollment chunk), its bytes are appended to
-    # `gated_audio`, transcribed once into `committed_text`, and cleared;
-    # rejected chunks are discarded.
+    # `gated_audio` for the final pass and cleared; rejected chunks are
+    # discarded.
     gated_audio = bytearray()
     pending_audio = bytearray()
     raw_audio = bytearray()      # full mic stream, used when VAD is too strict
     raw_partial_audio = bytearray()
     partial_audio = bytearray()  # all audio for partial transcription (never cleared)
-    committed_text = ""
     staging = bytearray()
     prev_window = []
     gate_state = {'silence_run': 0, 'gate_was_open': False}
@@ -625,16 +699,15 @@ async def ws_transcribe(ws: WebSocket):
     last_partial_text = ""
     raw_signal_bytes = 0
     raw_signal_bytes_at_last_partial = 0
-    gated_len_at_last_partial = 0
-    pending_len_at_last_partial = 0
+    native_stream_state = None
+    partial_task = None
+    closing = False
     loop = asyncio.get_event_loop()
     slog = SessionLogger("ws")
     protocol_session: Optional[AsrProtocolSession] = None
     protocol_session_id = ""
     protocol_stop_id = ""
     send_lock = asyncio.Lock()
-    partial_generation = 0
-    partial_task: Optional[asyncio.Task] = None
 
     # ASR context hint (distilled terminal vocabulary, etc.) arrives in the
     # required protocol start/resume message.
@@ -655,34 +728,29 @@ async def ws_transcribe(ws: WebSocket):
             staging=staging,
             gate_state=gate_state,
             reference_embedding=reference_embedding,
-            committed_text=committed_text,
             last_partial_text=last_partial_text,
             raw_signal_bytes=raw_signal_bytes,
             raw_signal_bytes_at_last_partial=raw_signal_bytes_at_last_partial,
-            gated_len_at_last_partial=gated_len_at_last_partial,
-            pending_len_at_last_partial=pending_len_at_last_partial,
+            native_stream_state=native_stream_state,
         )
 
     def hydrate_from_protocol_session(sess: AsrProtocolSession) -> None:
         nonlocal gated_audio, pending_audio, raw_audio, raw_partial_audio
-        nonlocal partial_audio, committed_text, staging, gate_state
+        nonlocal partial_audio, staging, gate_state
         nonlocal reference_embedding, last_partial_text, raw_signal_bytes
-        nonlocal raw_signal_bytes_at_last_partial, gated_len_at_last_partial
-        nonlocal pending_len_at_last_partial
+        nonlocal raw_signal_bytes_at_last_partial, native_stream_state
         gated_audio = bytearray(sess.gated_audio)
         pending_audio = bytearray(sess.pending_audio)
         raw_audio = bytearray(sess.raw_audio())
         raw_partial_audio = bytearray(sess.raw_partial_audio)
         partial_audio = bytearray(sess.partial_audio)
-        committed_text = sess.committed_text
         staging = bytearray(sess.staging)
         gate_state = dict(sess.gate_state)
         reference_embedding = sess.reference_embedding
         last_partial_text = sess.last_partial_text
         raw_signal_bytes = sess.raw_signal_bytes
         raw_signal_bytes_at_last_partial = sess.raw_signal_bytes_at_last_partial
-        gated_len_at_last_partial = sess.gated_len_at_last_partial
-        pending_len_at_last_partial = sess.pending_len_at_last_partial
+        native_stream_state = sess.native_stream_state
 
     async def send_protocol_ack() -> None:
         if protocol_session is None:
@@ -694,9 +762,40 @@ async def ws_transcribe(ws: WebSocket):
             "ackSeq": protocol_session.highest_contiguous_seq,
         })
 
+    async def emit_partial(text: str, audio_sec: Optional[float] = None) -> None:
+        nonlocal last_partial_text
+        if closing or not text or text == last_partial_text:
+            return
+        delta = None
+        if text.startswith(last_partial_text):
+            delta = text[len(last_partial_text):]
+        payload = {
+            "type": "partial",
+            "sessionId": protocol_session_id,
+            "partial": text,
+        }
+        if delta:
+            payload["delta"] = delta
+        await send_json(payload)
+        last_partial_text = text
+        sync_protocol_session()
+        log.info("Partial: %s", text[:80])
+        ev = {"text": text}
+        if audio_sec is not None:
+            ev["audio_sec"] = audio_sec
+        slog.event("partial", ev)
+
+    def using_native_stream() -> bool:
+        return native_stream_state is not None
+
+    async def feed_native_partial(audio_bytes: bytes) -> None:
+        if not using_native_stream():
+            return
+        text = await feed_native_stream(native_stream_state, audio_bytes)
+        await emit_partial(text, len(raw_audio) / BYTES_PER_SEC)
+
     async def apply_events(events):
-        nonlocal reference_embedding, committed_text, gated_len_at_last_partial
-        nonlocal pending_len_at_last_partial
+        nonlocal reference_embedding
         for ev in events:
             if ev[0] == 'audio':
                 pending_audio.extend(ev[1])
@@ -706,7 +805,6 @@ async def ws_transcribe(ws: WebSocket):
                     slog.event("boundary_short", {
                         "pending_bytes": len(pending_audio)})
                     pending_audio.clear()
-                    pending_len_at_last_partial = 0
                     continue
 
                 # Speaker check (off-thread — embedding takes ~30-50ms).
@@ -737,20 +835,10 @@ async def ws_transcribe(ws: WebSocket):
 
                 if accept:
                     gated_audio.extend(pending_audio)
-                    chunk_text = (
-                        await _transcribe_buffer(
-                            bytearray(chunk_bytes),
-                            context=asr_context,
-                        )
-                        or ""
-                    ).strip()
-                    if chunk_text:
-                        committed_text = _join_text(committed_text, chunk_text)
                     slog.event("chunk_accepted", {
                         "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
                         "speaker_sim": sim_val,
                         "gated_sec": len(gated_audio) / BYTES_PER_SEC,
-                        "text": chunk_text,
                     })
                 else:
                     slog.event("reject", {
@@ -758,130 +846,94 @@ async def ws_transcribe(ws: WebSocket):
                         "speaker_sim": sim_val})
 
                 pending_audio.clear()
-                pending_len_at_last_partial = 0
 
-    async def run_partial_task(
-        generation: int,
-        audio_snapshot: bytearray,
-        committed_snapshot: str,
-        context_snapshot: str,
-    ) -> None:
-        nonlocal last_partial_text, partial_task
+    def partial_snapshot() -> bytes:
+        buf = raw_partial_audio if raw_partial_audio else partial_audio
+        if len(buf) > PARTIAL_WINDOW_BYTES:
+            return bytes(buf[-PARTIAL_WINDOW_BYTES:])
+        return bytes(buf)
+
+    async def transcribe_partial(buf: bytes) -> str:
+        """Transcribe the last N seconds of audio for live partials.
+        Uses a sliding window so long utterances don't blow up.
+        Returns stripped text ("" if empty/failed)."""
+        if len(buf) < int(BYTES_PER_SEC * 0.3):
+            return ""
+        text = (
+            await _transcribe_buffer(bytearray(buf), context=asr_context)
+            or ""
+        ).strip()
+        return text
+
+    async def run_partial(buf: bytes, signal_snapshot: int) -> None:
+        nonlocal last_partial_time, last_partial_text
+        nonlocal raw_signal_bytes_at_last_partial
+        audio_sec = len(buf) / BYTES_PER_SEC
+        slog.event("partial_begin", {
+            "audio_sec": audio_sec,
+            "signal_bytes": signal_snapshot,
+        })
         try:
-            if len(audio_snapshot) < int(BYTES_PER_SEC * 0.3):
-                text = committed_snapshot
-            else:
-                text = (
-                    await _transcribe_buffer(
-                        bytearray(audio_snapshot),
-                        context=context_snapshot,
-                    )
-                    or ""
-                ).strip()
-
-            if generation != partial_generation:
-                slog.event("partial_stale", {
-                    "generation": generation,
-                    "current_generation": partial_generation,
-                    "chars": len(text),
-                })
+            text = await transcribe_partial(buf)
+            if closing:
+                slog.event("partial_suppressed", {"reason": "closing"})
                 return
-
-            if text and text != last_partial_text:
-                delta = None
-                if text.startswith(last_partial_text):
-                    delta = text[len(last_partial_text):]
-                if delta:
-                    await send_json({
-                        "type": "partial",
-                        "sessionId": protocol_session_id,
-                        "partial": text,
-                        "delta": delta,
-                    })
-                else:
-                    await send_json({
-                        "type": "partial",
-                        "sessionId": protocol_session_id,
-                        "partial": text,
-                    })
-                last_partial_text = text
-                sync_protocol_session()
-                log.info("Partial: %s", text[:80])
-                slog.event("partial", {
-                    "generation": generation,
-                    "audio_sec": len(audio_snapshot) / BYTES_PER_SEC,
-                    "text": text,
-                })
-        except asyncio.CancelledError:
-            slog.event("partial_cancelled", {"generation": generation})
-            raise
-        except Exception as e:
-            log.exception("Partial task failed: %s", e)
-            slog.event("partial_error", {
-                "generation": generation,
-                "message": str(e),
-            })
+            await emit_partial(text, audio_sec)
         finally:
-            if partial_task is asyncio.current_task():
-                partial_task = None
+            last_partial_time = time.monotonic()
+            raw_signal_bytes_at_last_partial = max(
+                raw_signal_bytes_at_last_partial,
+                signal_snapshot,
+            )
+            slog.event("partial_done", {
+                "audio_sec": audio_sec,
+                "signal_bytes": signal_snapshot,
+            })
+
+    def observe_partial_task(task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Partial transcription task failed")
+            slog.event("partial_error")
 
     async def maybe_send_partial() -> None:
         nonlocal partial_task
-        nonlocal last_partial_time, last_partial_text
-        nonlocal raw_signal_bytes_at_last_partial
-        nonlocal gated_len_at_last_partial, pending_len_at_last_partial
 
-        if partial_task is not None:
-            if partial_task.done():
-                partial_task = None
-            else:
-                return
+        if not ASR_PARTIALS_ENABLED:
+            return
+        if closing:
+            return
+        if partial_task is not None and not partial_task.done():
+            return
 
         now = time.monotonic()
-        total_new_audio = (
-            (raw_signal_bytes - raw_signal_bytes_at_last_partial)
-            + (len(gated_audio) - gated_len_at_last_partial)
-            + (len(pending_audio) - pending_len_at_last_partial)
-        )
-        if total_new_audio <= 0:
+        new_signal_bytes = raw_signal_bytes - raw_signal_bytes_at_last_partial
+        if new_signal_bytes < PARTIAL_MIN_DELTA_BYTES:
             return
 
         if now - last_partial_time < PARTIAL_INTERVAL_SEC:
             return
 
-        # Snapshot the newest tail and let the receive loop keep reading audio.
-        # If newer audio arrives before this finishes, the result is stale and
-        # dropped; there is never a queue of old partial model calls.
-        buf = raw_partial_audio if raw_partial_audio else partial_audio
-        if len(buf) > PARTIAL_WINDOW_BYTES:
-            buf = buf[-PARTIAL_WINDOW_BYTES:]
-        audio_snapshot = bytearray(buf)
-        generation = partial_generation
-        partial_task = asyncio.create_task(
-            run_partial_task(
-                generation,
-                audio_snapshot,
-                committed_text,
-                asr_context,
-            )
-        )
-        slog.event("partial_scheduled", {
-            "generation": generation,
-            "audio_sec": len(audio_snapshot) / BYTES_PER_SEC,
-        })
-        last_partial_time = now
-        raw_signal_bytes_at_last_partial = raw_signal_bytes
-        gated_len_at_last_partial = len(gated_audio)
-        pending_len_at_last_partial = len(pending_audio)
+        buf = partial_snapshot()
+        if len(buf) < int(BYTES_PER_SEC * 0.3):
+            return
+
+        signal_snapshot = raw_signal_bytes
+        partial_task = asyncio.create_task(run_partial(buf, signal_snapshot))
+        partial_task.add_done_callback(observe_partial_task)
 
     try:
         while True:
             try:
                 data = await asyncio.wait_for(ws.receive(), timeout=0.1)
             except asyncio.TimeoutError:
-                events = _process_staged_audio(staging, prev_window, gate_state)
-                await apply_events(events)
-                await maybe_send_partial()
+                if not using_native_stream():
+                    events = _process_staged_audio(staging, prev_window, gate_state)
+                    await apply_events(events)
+                    await maybe_send_partial()
                 continue
             except RuntimeError as e:
                 if "disconnect message" in str(e):
@@ -923,7 +975,10 @@ async def ws_transcribe(ws: WebSocket):
                 events = _process_staged_audio(staging, prev_window, gate_state)
                 await apply_events(events)
                 sync_protocol_session()
-                await maybe_send_partial()
+                if using_native_stream():
+                    await feed_native_partial(audio_bytes)
+                else:
+                    await maybe_send_partial()
             elif "text" in data:
                 msg = json.loads(data["text"])
                 msg_type = msg.get("type")
@@ -953,6 +1008,13 @@ async def ws_transcribe(ws: WebSocket):
                     )
                     hydrate_from_protocol_session(protocol_session)
                     asr_context = msg.get("context") or ""
+                    if native_streaming_available() and native_stream_state is None:
+                        native_stream_state = init_native_stream(asr_context)
+                        sync_protocol_session()
+                        slog.event("native_stream_started", {
+                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
+                            "finalization_mode": ASR_STREAM_FINALIZATION_MODE,
+                        })
                     slog.event("protocol_started", {
                         "session_id": protocol_session_id,
                         "resume": msg_type == "resume",
@@ -974,9 +1036,7 @@ async def ws_transcribe(ws: WebSocket):
                         })
                         slog.event("protocol_error", {"reason": "stop_before_start"})
                         break
-                    partial_generation += 1
-                    if partial_task is not None and not partial_task.done():
-                        partial_task.cancel()
+                    closing = True
                     protocol_stop_id = str(msg.get("stopId") or "")
                     slog.event("stop_requested", {
                         "session_id": protocol_session.session_id,
@@ -999,9 +1059,53 @@ async def ws_transcribe(ws: WebSocket):
                             "stopId": protocol_stop_id,
                         })
                         break
+                    if using_native_stream():
+                        final_text = await finish_native_stream(native_stream_state)
+                        if not final_text and last_partial_text:
+                            final_text = last_partial_text
+                            slog.event("final_from_last_partial", {"text": final_text})
+                        if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
+                            final_text = (
+                                await _transcribe_buffer(raw_audio, context=asr_context)
+                                or ""
+                            ).strip()
+                            if final_text:
+                                slog.event("final_raw_fallback", {"text": final_text})
+                        slog.event("final", {
+                            "text": final_text,
+                            "native_stream": True,
+                        })
+                        protocol_session.final_text = final_text
+                        protocol_session.final_stop_id = protocol_stop_id
+                        protocol_session.updated = time.monotonic()
+                        await send_json({
+                            "type": "final",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                            "text": final_text,
+                        })
+                        if final_text:
+                            log.info("Final (native stop): %s", final_text[:80])
+                        slog.event("done", {"stop_id": protocol_stop_id})
+                        await send_json({
+                            "type": "done",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                        })
+                        await asyncio.sleep(0.05)
+                        break
                     # Flush remaining staged audio, apply boundary events
                     events = _process_staged_audio(staging, prev_window, gate_state)
                     await apply_events(events)
+                    if partial_task is not None and not partial_task.done():
+                        if ASR_FINAL_WAIT_PARTIAL:
+                            slog.event("final_wait_partial")
+                            try:
+                                await partial_task
+                            except Exception:
+                                log.exception("Partial transcription failed before final")
+                        else:
+                            slog.event("final_skip_partial")
 
                     # Tail: if pending has enough speech, speaker-check
                     # and (if accepted) roll it into gated_audio before
@@ -1103,10 +1207,9 @@ async def ws_transcribe(ws: WebSocket):
         except Exception:
             pass
     finally:
-        if partial_task is not None and not partial_task.done():
-            partial_task.cancel()
         # Finalize session log (PCM → FLAC) in executor so we don't block.
         try:
+            closing = True
             await loop.run_in_executor(None, slog.close)
         except Exception:
             log.exception("Session logger close failed")

@@ -1,5 +1,5 @@
 # ASR model (Apple Silicon MLX)
-mlx-qwen3-asr==0.3.2
+mlx-qwen3-asr==0.3.5
 
 # Web framework
 fastapi==0.135.3
