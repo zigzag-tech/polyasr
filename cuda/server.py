@@ -1120,9 +1120,6 @@ async def ws_transcribe(ws: WebSocket):
                         break
                     if using_native_stream():
                         final_text = await finish_native_stream(native_stream_state)
-                        if not final_text and last_partial_text:
-                            final_text = last_partial_text
-                            slog.event("final_from_last_partial", {"text": final_text})
                         if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
                             final_text = (
                                 await _transcribe_buffer(raw_audio, context=asr_context)
@@ -1130,6 +1127,9 @@ async def ws_transcribe(ws: WebSocket):
                             ).strip()
                             if final_text:
                                 slog.event("final_raw_fallback", {"text": final_text})
+                        if not final_text and last_partial_text:
+                            final_text = last_partial_text
+                            slog.event("final_from_last_partial", {"text": final_text})
                         slog.event("final", {
                             "text": final_text,
                             "native_stream": True,
@@ -1196,21 +1196,12 @@ async def ws_transcribe(ws: WebSocket):
                         pending_audio.clear()
 
                     final_text = ""
-                    # Fast path: if the utterance fits in the partial window,
-                    # the last partial already transcribed the same audio.
-                    # Skip the redundant full-buffer transcription.
-                    if (
-                        len(gated_audio) >= int(BYTES_PER_SEC * 0.3)
-                        and len(gated_audio) <= PARTIAL_WINDOW_BYTES
-                        and last_partial_text
-                    ):
-                        final_text = last_partial_text
-                        slog.event("final_from_last_partial_fastpath", {"text": final_text})
-                    elif len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
+                    # The final must be based on the complete captured audio,
+                    # not a stale early partial. Short commands can be below
+                    # the VAD commit threshold, leaving `gated_audio` empty
+                    # while `raw_audio` contains the full utterance.
+                    if len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
                         final_text = (await _transcribe_buffer(gated_audio, context=asr_context) or "").strip()
-                    if not final_text and last_partial_text:
-                        final_text = last_partial_text
-                        slog.event("final_from_last_partial", {"text": final_text})
                     if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
                         final_text = (
                             await _transcribe_buffer(raw_audio, context=asr_context)
@@ -1218,6 +1209,9 @@ async def ws_transcribe(ws: WebSocket):
                         ).strip()
                         if final_text:
                             slog.event("final_raw_fallback", {"text": final_text})
+                    if not final_text and last_partial_text:
+                        final_text = last_partial_text
+                        slog.event("final_from_last_partial", {"text": final_text})
                     slog.event("final", {"text": final_text})
                     protocol_session.final_text = final_text
                     protocol_session.final_stop_id = protocol_stop_id
