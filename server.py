@@ -56,6 +56,16 @@ _transcribe_lock = threading.Lock()
 # Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
 # cache after every transcription so memory stays bounded.
 ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
+# A short or near-silent clip must never run the decoder out to the full token
+# budget. Low-signal audio makes ASR models loop/hallucinate until
+# max_new_tokens, which on a contended MLX GPU can take 20-30s — long enough to
+# blow past the client's final-wait timeout. Worse, because every inference
+# (partials, finals, batch) serializes on _transcribe_lock, one runaway stalls
+# all of them behind it. Cap tokens by audio length; 25 tok/s is 4-8x real
+# speech, so legitimate transcripts are never truncated (long clips still hit
+# the 256 ceiling unchanged — only short clips get a tighter, safer bound).
+ASR_MIN_NEW_TOKENS = int(os.environ.get("ASR_MIN_NEW_TOKENS", "32"))
+ASR_TOKENS_PER_AUDIO_SEC = int(os.environ.get("ASR_TOKENS_PER_AUDIO_SEC", "25"))
 ASR_NATIVE_STREAMING = os.environ.get("ASR_NATIVE_STREAMING", "0").lower() not in {
     "0",
     "false",
@@ -545,7 +555,25 @@ async def transcribe(
         tmp.close()
 
         session = get_session()
-        kwargs = {"max_new_tokens": ASR_MAX_NEW_TOKENS}
+        # Bound decoder length by audio duration (see _transcribe_buffer): a
+        # short/low-signal upload must not run away to the full token budget and
+        # stall the shared transcribe lock. Best-effort WAV duration; fall back
+        # to the full budget if the container can't be measured.
+        batch_max_tokens = ASR_MAX_NEW_TOKENS
+        try:
+            import wave as _wave
+            with _wave.open(tmp.name, "rb") as _wf:
+                _audio_sec = _wf.getnframes() / float(_wf.getframerate() or 1)
+            batch_max_tokens = max(
+                ASR_MIN_NEW_TOKENS,
+                min(
+                    ASR_MAX_NEW_TOKENS,
+                    int(_audio_sec * ASR_TOKENS_PER_AUDIO_SEC) + 1,
+                ),
+            )
+        except Exception:
+            pass
+        kwargs = {"max_new_tokens": batch_max_tokens}
         if language:
             kwargs["language"] = language
         if context:
@@ -1220,7 +1248,17 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
         session = get_session()
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_event_loop()
-        kwargs: dict = {"max_new_tokens": ASR_MAX_NEW_TOKENS}
+        # Bound decoder length by audio duration so a short/low-signal clip
+        # can't run away to the full token budget and stall the shared lock.
+        token_budget = max(
+            ASR_MIN_NEW_TOKENS,
+            min(
+                ASR_MAX_NEW_TOKENS,
+                (len(audio_buffer) * ASR_TOKENS_PER_AUDIO_SEC + BYTES_PER_SEC - 1)
+                // BYTES_PER_SEC,
+            ),
+        )
+        kwargs: dict = {"max_new_tokens": token_budget}
         if context:
             kwargs["context"] = context
         def run_transcribe():
