@@ -51,6 +51,9 @@ _session = None
 _vad_model = None
 _voice_encoder = None
 _transcribe_lock = threading.Lock()
+# Monotonic timestamp of the most recent transcription, used by the keep-warm
+# loop to skip warmups when real traffic is already keeping the model hot.
+_last_transcribe_monotonic = 0.0
 
 # MLX allocates Metal buffers aggressively and never returns them to the OS.
 # Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
@@ -66,6 +69,12 @@ ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
 # the 256 ceiling unchanged — only short clips get a tighter, safer bound).
 ASR_MIN_NEW_TOKENS = int(os.environ.get("ASR_MIN_NEW_TOKENS", "32"))
 ASR_TOKENS_PER_AUDIO_SEC = int(os.environ.get("ASR_TOKENS_PER_AUDIO_SEC", "25"))
+# Keep the MLX model/Metal kernels hot. After an idle gap the first inference
+# takes ~9s (vs ~0.6s warm) — long enough that the first streaming partial
+# misses the client's ~10s no-partial timeout, so live text never appears on
+# the first dictation after a lull (only the batch fallback delivers, at stop).
+# A tiny periodic warmup during idle gaps keeps it resident. 0 disables.
+ASR_KEEPWARM_INTERVAL_SEC = float(os.environ.get("ASR_KEEPWARM_INTERVAL_SEC", "45"))
 ASR_NATIVE_STREAMING = os.environ.get("ASR_NATIVE_STREAMING", "0").lower() not in {
     "0",
     "false",
@@ -526,6 +535,15 @@ async def startup_event():
     get_session()
     get_vad()
     get_encoder()
+    # Warm the model now so the very first request after a (re)start is fast,
+    # then keep it warm during idle gaps.
+    try:
+        await _transcribe_buffer(bytearray(int(BYTES_PER_SEC * 0.3)))
+        log.info("Startup warmup complete (keepwarm interval=%.0fs).",
+                 ASR_KEEPWARM_INTERVAL_SEC)
+    except Exception:
+        log.exception("Startup warmup failed")
+    asyncio.create_task(_keepwarm_loop())
     log.info("Server ready.")
 
 
@@ -1237,8 +1255,30 @@ async def ws_transcribe(ws: WebSocket):
             log.exception("Session logger close failed")
 
 
+async def _keepwarm_loop():
+    """Run a tiny inference during idle gaps so the model/Metal kernels stay
+    hot and the first real partial after a lull isn't ~9s (which would miss the
+    client's no-partial timeout). Skips itself whenever real traffic already
+    kept the model warm within the interval."""
+    if ASR_KEEPWARM_INTERVAL_SEC <= 0:
+        return
+    silence = bytes(int(BYTES_PER_SEC * 0.3))
+    while True:
+        await asyncio.sleep(ASR_KEEPWARM_INTERVAL_SEC)
+        if time.monotonic() - _last_transcribe_monotonic < ASR_KEEPWARM_INTERVAL_SEC:
+            continue
+        try:
+            t0 = time.monotonic()
+            await _transcribe_buffer(bytearray(silence))
+            log.info("keepwarm tick (%.2fs)", time.monotonic() - t0)
+        except Exception:
+            log.exception("keepwarm transcription failed")
+
+
 async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
     """Transcribe the accumulated audio buffer."""
+    global _last_transcribe_monotonic
+    _last_transcribe_monotonic = time.monotonic()
     wav_bytes = pcm_to_wav_bytes(bytes(audio_buffer))
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     try:
