@@ -535,6 +535,14 @@ async def startup_event():
     get_session()
     get_vad()
     get_encoder()
+    log.info(
+        "ASR config: partials=%s partial_interval=%.2fs partial_min_delta=%.2fs native_streaming=%s final_wait_partial=%s",
+        ASR_PARTIALS_ENABLED,
+        PARTIAL_INTERVAL_SEC,
+        PARTIAL_MIN_DELTA_SEC,
+        ASR_NATIVE_STREAMING,
+        ASR_FINAL_WAIT_PARTIAL,
+    )
     # Warm the model now so the very first request after a (re)start is fast,
     # then keep it warm during idle gaps.
     try:
@@ -1054,13 +1062,13 @@ async def ws_transcribe(ws: WebSocket):
                     )
                     hydrate_from_protocol_session(protocol_session)
                     asr_context = msg.get("context") or ""
-                    if native_streaming_available() and native_stream_state is None:
-                        native_stream_state = init_native_stream(asr_context)
-                        sync_protocol_session()
-                        slog.event("native_stream_started", {
-                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
-                            "finalization_mode": ASR_STREAM_FINALIZATION_MODE,
-                        })
+                    # Send the started/resumed ack FIRST, before the (potentially
+                    # slow, decode-lock/keepwarm-contended) native stream init.
+                    # A client on a tight start-ack timeout — especially over a
+                    # cross-border regional relay — was being dropped while
+                    # init_native_stream warmed the decoder (observed: 1220ms
+                    # server-silent at 158ms RTT). The ack only acknowledges the
+                    # session; ackSeq is the pre-audio seq either way.
                     slog.event("protocol_started", {
                         "session_id": protocol_session_id,
                         "resume": msg_type == "resume",
@@ -1073,6 +1081,13 @@ async def ws_transcribe(ws: WebSocket):
                         "sessionId": protocol_session_id,
                         "ackSeq": protocol_session.highest_contiguous_seq,
                     })
+                    if native_streaming_available() and native_stream_state is None:
+                        native_stream_state = init_native_stream(asr_context)
+                        sync_protocol_session()
+                        slog.event("native_stream_started", {
+                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
+                            "finalization_mode": ASR_STREAM_FINALIZATION_MODE,
+                        })
                     continue
                 if msg_type == "stop":
                     if protocol_session is None:
