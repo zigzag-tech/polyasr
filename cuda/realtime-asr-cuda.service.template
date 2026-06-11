@@ -15,6 +15,14 @@ Environment=ASR_PORT=8766
 Environment=ASR_LOG_DIR=__REPO__/cuda/logs
 # Hugging Face cache persists across restarts so model reload is fast.
 Environment=HF_HOME=__HF_HOME__
+# huggingface.co is unreachable from CN hosts (SSL EOF). Even via the mirror,
+# the model's speculative `custom_generate/generate.py` Hub fetch hangs on the
+# CDN and wedges model load (weights load fine, then from_pretrained hangs).
+# The model+config are cached, so load fully offline; the mirror endpoint is a
+# fallback for the rare case the cache must be repopulated manually.
+Environment=HF_ENDPOINT=https://hf-mirror.com
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
 ExecStart=__REPO__/cuda/venv/bin/python __REPO__/cuda/server.py
 Restart=on-failure
 RestartSec=5
