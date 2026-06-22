@@ -15,8 +15,9 @@ Environment=POLYASR_DTYPE=bfloat16
 Environment=POLYASR_PORT=8766
 Environment=POLYASR_LOG_DIR=__REPO__/cuda/logs
 # Idle-evict the resident model after this many seconds so a co-resident
-# polytts/renderer can reclaim the GPU. 0 disables (never evict).
-Environment=POLYASR_IDLE_EVICT_SECONDS=180
+# co-resident workload can reclaim the GPU. Default 0 = never evict: this
+# service backs benchday live dictation, which needs the model warm at all times.
+Environment=POLYASR_IDLE_EVICT_SECONDS=0
 # Hugging Face cache persists across restarts so model reload is fast.
 Environment=HF_HOME=__HF_HOME__
 # huggingface.co is unreachable from CN hosts (SSL EOF). Even via the mirror,
