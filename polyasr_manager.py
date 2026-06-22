@@ -12,7 +12,12 @@ each use.
 
 A "unit" is identified by a string key. The ASR model is one unit; the
 forced-aligner model (which loads a heavier ASR+aligner pair) is a second unit.
-Loading one unit evicts the other so they never co-reside.
+
+Co-residency (``POLYASR_COLOAD``, default on): both units may stay resident at
+once so benchday's ``asr`` is never evicted when unchain loads ``align``. With
+co-load OFF, loading one unit evicts any other so only one is in VRAM at a time
+(the historical behaviour). Either way ``unload_now()``, ``maybe_evict()`` and
+``/model/unload`` free every resident unit.
 
 Backends supply the actual load/unload/free callbacks via ``ManagedUnit`` so
 the manager stays backend-agnostic (CUDA torch.cuda.empty_cache vs MLX
@@ -25,7 +30,7 @@ from __future__ import annotations
 import gc
 import time
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 
 def free_cuda() -> None:
@@ -87,31 +92,47 @@ class ManagedUnit:
 
 
 class AsrModelManager:
-    """One managed unit resident at a time, evicted after idle. GPU-thread only
-    beyond the bookkeeping guard."""
+    """Manages resident model units, evicting after idle. GPU-thread only beyond
+    the bookkeeping guard.
 
-    def __init__(self, units: dict[str, ManagedUnit], idle_seconds: int):
+    coload=True  : loading a unit does NOT evict the others; several units may
+                   be resident at once (so benchday's `asr` survives an `align`
+                   load). Both 1.7B asr and 0.6B aligner fit comfortably.
+    coload=False : at most one unit resident; loading one evicts any other
+                   (historical one-in-VRAM behaviour)."""
+
+    def __init__(self, units: dict[str, ManagedUnit], idle_seconds: int,
+                 coload: bool = True):
         self.units = units
         self.idle_seconds = idle_seconds
-        self.resident: Optional[str] = None
+        self.coload = coload
+        self._resident: set[str] = set()
         self.last_used = time.monotonic()
         self._guard = threading.Lock()
 
+    @property
+    def resident(self) -> set[str]:
+        return self._resident
+
     def ensure(self, name: str) -> object:
-        """Make `name` resident, evicting any other unit. Returns the model.
-        Resets the idle timer. GPU-thread only."""
+        """Make `name` resident, returning its model. In one-in-VRAM mode this
+        evicts any other unit; in co-load mode the others stay resident. Resets
+        the idle timer. GPU-thread only."""
         if name not in self.units:
             raise KeyError(f"unknown unit: {name}")
         with self._guard:
-            if self.resident != name:
-                if self.resident is not None:
-                    self.units[self.resident].unload()
-                    print(f"[asr-manager] evicted {self.resident} to load {name}",
-                          flush=True)
-                    self.resident = None
+            if name not in self._resident:
+                if not self.coload:
+                    for other in list(self._resident):
+                        if other != name:
+                            self.units[other].unload()
+                            self._resident.discard(other)
+                            print(f"[asr-manager] evicted {other} to load {name}",
+                                  flush=True)
                 model = self.units[name].load()
-                self.resident = name
-                print(f"[asr-manager] loaded {name}", flush=True)
+                self._resident.add(name)
+                print(f"[asr-manager] loaded {name} "
+                      f"(resident={sorted(self._resident)})", flush=True)
             else:
                 model = self.units[name].model
             self.last_used = time.monotonic()
@@ -122,37 +143,40 @@ class AsrModelManager:
         frame so an active dictation session never gets idle-evicted."""
         self.last_used = time.monotonic()
 
-    def unload_now(self) -> Optional[str]:
-        """Force-evict the resident unit now, regardless of idle time. Returns
-        the name that was unloaded (or None). For GPU hand-off."""
+    def unload_now(self) -> list[str]:
+        """Force-evict ALL resident units now, regardless of idle time. Returns
+        the names unloaded (possibly empty). For GPU hand-off."""
         with self._guard:
-            evicted = self.resident
-            if evicted is not None:
-                self.units[evicted].unload()
-                self.resident = None
+            evicted = sorted(self._resident)
+            for name in list(self._resident):
+                self.units[name].unload()
+                self._resident.discard(name)
+            if evicted:
                 print(f"[asr-manager] force-unloaded {evicted}", flush=True)
             else:
                 trim_ram()
             return evicted
 
     def maybe_evict(self) -> bool:
-        """Evict the resident unit if idle past the timeout. GPU-thread only."""
+        """Evict ALL resident units if idle past the timeout. GPU-thread only."""
         if self.idle_seconds <= 0:
             return False
         with self._guard:
-            if self.resident and (time.monotonic() - self.last_used) > self.idle_seconds:
-                evicted = self.resident
-                self.units[evicted].unload()
-                self.resident = None
+            if self._resident and (time.monotonic() - self.last_used) > self.idle_seconds:
+                evicted = sorted(self._resident)
+                for name in list(self._resident):
+                    self.units[name].unload()
+                    self._resident.discard(name)
                 print(f"[asr-manager] idle-evicted {evicted}", flush=True)
                 return True
         return False
 
     def status(self) -> dict:
         return {
-            "resident": self.resident,
+            "resident": sorted(self._resident),
+            "coload": self.coload,
             "idle_seconds": self.idle_seconds,
             "idle_for": (round(time.monotonic() - self.last_used, 1)
-                         if self.resident else None),
+                         if self._resident else None),
             "units": list(self.units.keys()),
         }

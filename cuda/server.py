@@ -39,7 +39,7 @@ from typing import Optional
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Body, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Shared poly* modules live in the repo root; this server runs from cuda/.
@@ -80,6 +80,10 @@ ALIGNER_MODEL = _env("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 # Idle-evict the resident model after this many seconds (0 = never evict) so a
 # co-resident polytts/renderer can reclaim the GPU.
 IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
+# Co-residency: when on (default), loading a unit does NOT evict the other, so
+# benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
+# historical one-model-in-VRAM eviction behaviour.
+COLOAD = _envflag("COLOAD", "1")
 ASR_NATIVE_STREAMING = (
     _env("NATIVE_STREAMING", "1" if ASR_BACKEND == "vllm" else "0").lower()
     not in {"0", "false", "no"}
@@ -287,15 +291,17 @@ def _load_align_model():
     return model
 
 
-# One-model-in-VRAM manager: the 'asr' and 'align' units never co-reside;
-# loading one evicts the other, and the resident unit is idle-evicted so a
-# co-resident polytts/renderer can reclaim the GPU.
+# Model manager. With COLOAD on (default) the 'asr' and 'align' units co-reside
+# so benchday's asr is never evicted by an unchain align; with COLOAD off they
+# never co-reside (loading one evicts the other). Either way idle-evict reclaims
+# the GPU for a co-resident polytts/renderer.
 manager = AsrModelManager(
     {
         "asr": ManagedUnit("asr", _load_asr_model, free_cuda),
         "align": ManagedUnit("align", _load_align_model, free_cuda),
     },
     IDLE_EVICT_SECONDS,
+    coload=COLOAD,
 )
 
 
@@ -744,10 +750,12 @@ async def transcribe(
 # ---------------------------------------------------------------------------
 # Forced-alignment endpoint (port of unchain scripts/python/qwen3_asr.py)
 # ---------------------------------------------------------------------------
-def _align_cuda(audio_path: Path, language: Optional[str], max_chunk_seconds: int) -> dict:
-    """Run the forced aligner over the audio (chunked ≤ max_chunk_seconds) and
-    return the shared forced-alignment JSON schema. Runs on a worker thread
-    while holding _transcribe_lock (load + per-chunk transcribe serialized)."""
+def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int) -> dict:
+    """Align one local audio file (chunked ≤ max_chunk_seconds) and return
+    {text, language, segments} (NO 'model' key — callers add it). Runs on a
+    worker thread while holding _transcribe_lock (load + per-chunk transcribe
+    serialized). Shared by /v1/align and /v1/align/manifest."""
+    audio_path = path
     merged_text_parts: list[str] = []
     merged_segments: list[dict] = []
     detected_language: Optional[str] = None
@@ -798,7 +806,57 @@ def _align_cuda(audio_path: Path, language: Optional[str], max_chunk_seconds: in
         "text": "".join(merged_text_parts),
         "language": detected_language or language or "auto",
         "segments": merged_segments,
-        "model": f"{MODEL_NAME} + {ALIGNER_MODEL}",
+    }
+
+
+_ALIGN_MODEL_LABEL = f"{MODEL_NAME} + {ALIGNER_MODEL}"
+
+
+def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
+    """Return copies of `segments` with every start/end (segment + word) shifted
+    by `offset` seconds. Used to place a manifest entry's timings at its absolute
+    position in the stitched timeline."""
+    if not offset:
+        return segments
+    shifted: list[dict] = []
+    for seg in segments:
+        words = [
+            {**w, "start": w["start"] + offset, "end": w["end"] + offset}
+            for w in seg.get("words", [])
+        ]
+        shifted.append({
+            **seg,
+            "start": seg["start"] + offset,
+            "end": seg["end"] + offset,
+            "words": words,
+        })
+    return shifted
+
+
+def _align_manifest(items: list[dict], language: Optional[str],
+                    max_chunk_seconds: int) -> dict:
+    """Align each manifest entry's local audio, offset its timings by the
+    entry's `offset`, and concatenate text + segments across entries in order.
+    Returns one combined {text, language, segments}. Runs on a worker thread."""
+    merged_text_parts: list[str] = []
+    merged_segments: list[dict] = []
+    detected_language: Optional[str] = None
+    for idx, item in enumerate(items):
+        offset = float(item.get("offset", 0.0))
+        try:
+            one = align_local_path(item["_path"], language, max_chunk_seconds)
+        except Exception as e:
+            entry_id = item.get("id", idx)
+            raise RuntimeError(f"align failed for manifest entry {entry_id} "
+                               f"({item['_path']}): {e}") from e
+        if not detected_language:
+            detected_language = one.get("language")
+        merged_text_parts.append(one["text"])
+        merged_segments.extend(_offset_segments(one["segments"], offset))
+    return {
+        "text": "".join(merged_text_parts),
+        "language": detected_language or language or "auto",
+        "segments": merged_segments,
     }
 
 
@@ -809,9 +867,10 @@ async def align(
     max_chunk_seconds: int = Form(270),
     model: Optional[str] = Form(None),
 ):
-    """Forced alignment: returns text + per-sentence segments with per-char word
-    timestamps ({text,start,end}). `model` is accepted for API symmetry but the
-    server's configured POLYASR_MODEL/POLYASR_ALIGNER_MODEL are authoritative."""
+    """Forced alignment (multipart upload, for the non-co-located case): returns
+    text + per-sentence segments with per-char word timestamps ({text,start,end}).
+    `model` is accepted for API symmetry but the server's configured
+    POLYASR_MODEL/POLYASR_ALIGNER_MODEL are authoritative."""
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
@@ -822,8 +881,9 @@ async def align(
         loop = asyncio.get_event_loop()
         t0 = time.monotonic()
         result = await loop.run_in_executor(
-            None, _align_cuda, Path(tmp.name), language, int(max_chunk_seconds)
+            None, align_local_path, Path(tmp.name), language, int(max_chunk_seconds)
         )
+        result["model"] = _ALIGN_MODEL_LABEL
         log.info("Aligned in %.2fs: %d segments, %d chars",
                  time.monotonic() - t0, len(result["segments"]), len(result["text"]))
         return JSONResponse(result)
@@ -835,6 +895,52 @@ async def align(
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+@app.post("/v1/align/manifest")
+async def align_manifest(payload: dict = Body(...)):
+    """Forced alignment of a MANIFEST of co-located local audio clips at absolute
+    offsets (no upload — paths are local to this server). For each entry the
+    audio at `path` is aligned with the same backend as /v1/align, every
+    timestamp is shifted by the entry's `offset` (seconds), and text + segments
+    are concatenated across entries in manifest order. Returns one combined
+    result in the exact /v1/align schema.
+
+    Body: {"manifest":[{"path","offset","id"?},...], "language"?,
+           "max_chunk_seconds"?, "model"?}
+    400 if a path does not exist; 500 (naming the entry) on align failure."""
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, list) or not manifest:
+        raise HTTPException(status_code=400, detail="manifest must be a non-empty array")
+    language = payload.get("language")
+    max_chunk_seconds = int(payload.get("max_chunk_seconds", 270))
+
+    items: list[dict] = []
+    for idx, entry in enumerate(manifest):
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise HTTPException(status_code=400,
+                                detail=f"manifest entry {idx} missing 'path'")
+        p = Path(str(entry["path"]))
+        if not p.exists():
+            raise HTTPException(status_code=400,
+                                detail=f"manifest entry {entry.get('id', idx)} "
+                                       f"path not found: {p}")
+        items.append({**entry, "_path": p})
+
+    loop = asyncio.get_event_loop()
+    t0 = time.monotonic()
+    try:
+        result = await loop.run_in_executor(
+            None, _align_manifest, items, language, max_chunk_seconds
+        )
+    except Exception as e:
+        log.exception("Manifest alignment failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    result["model"] = _ALIGN_MODEL_LABEL
+    log.info("Aligned manifest (%d entries) in %.2fs: %d segments, %d chars",
+             len(items), time.monotonic() - t0,
+             len(result["segments"]), len(result["text"]))
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------

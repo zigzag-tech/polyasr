@@ -16,13 +16,19 @@ It provides three capabilities over that contract:
 1. **Streaming dictation** — `WS /ws/transcribe` (benchday's protocol: BASR
    framing, start/resume/stop, ackSeq, partial/final/done).
 2. **Batch transcription** — `POST /v1/audio/transcriptions` (OpenAI-compatible).
-3. **Forced alignment** — `POST /v1/align`, returning word/character-level
-   timestamps. Ported from unchain's Qwen3 aligner scripts.
+3. **Forced alignment** — `POST /v1/align` (multipart upload) and
+   `POST /v1/align/manifest` (co-located local clips at absolute offsets,
+   stitched into one result), returning word/character-level timestamps.
+   Ported from unchain's Qwen3 aligner scripts.
 
-Like polytts, polyasr keeps at most **one model resident in VRAM at a time** and
-**idle-evicts** it after a configurable timeout, so a co-resident workload
-(polytts, a renderer) can reclaim the GPU. `POST /model/unload` force-frees the
-model immediately for an explicit hand-off.
+By default polyasr **co-loads** its model units (`POLYASR_COLOAD=1`): the `asr`
+(streaming/batch) and `align` (forced-alignment) units may be resident at the
+same time, so benchday's `asr` is never evicted when unchain loads `align`.
+Set `POLYASR_COLOAD=0` for the historical **one-model-resident** behaviour
+(loading one unit evicts the other). Either way the resident unit(s) are
+**idle-evicted** after `POLYASR_IDLE_EVICT_SECONDS` so a co-resident workload
+(polytts, a renderer) can reclaim the GPU, and `POST /model/unload` force-frees
+all resident units immediately for an explicit hand-off.
 
 ## Layout
 
@@ -136,6 +142,38 @@ Returns:
 Word entries carry only `{text, start, end}`. (The aligner is char-level; it is
 tuned for CJK — Latin-script audio may align coarsely.)
 
+### Forced alignment — manifest
+
+```http
+POST /v1/align/manifest
+```
+
+For aligning a **manifest** of per-element audio clips that already live on the
+server's filesystem (no upload): each entry is aligned with the same backend as
+`/v1/align`, its timestamps are shifted by the entry's absolute `offset`
+(seconds), and text + segments are concatenated across entries in manifest
+order into one combined result.
+
+JSON body:
+
+```json
+{
+  "manifest": [
+    {"path": "/abs/local/el_1.wav", "offset": 0.0, "id": "el_1"},
+    {"path": "/abs/local/el_2.wav", "offset": 12.34, "id": "el_2"}
+  ],
+  "language": "Chinese",
+  "max_chunk_seconds": 270
+}
+```
+
+`path` is absolute and local to the server; `offset` is added to every
+timestamp produced from that entry; `id` is optional (used only in error
+messages). `language`, `max_chunk_seconds`, `model` are optional and behave as
+in `/v1/align`. Returns the **exact same schema** as `/v1/align` (one combined
+`{text, language, segments, model}`). Errors: `400` if a path doesn't exist or
+the manifest is empty; `500` (naming the failing entry) on align failure.
+
 ### Model unload
 
 ```http
@@ -219,7 +257,8 @@ units keep working until they're updated.
 |---|---|---|
 | `POLYASR_MODEL` | `Qwen/Qwen3-ASR-0.6B` (MLX), `Qwen/Qwen3-ASR-1.7B` (CUDA) | ASR model id. |
 | `POLYASR_PORT` | `8765` (MLX) / `8766` (CUDA) | Bind port. |
-| `POLYASR_IDLE_EVICT_SECONDS` | `180` | Evict the resident model after this idle window. `0` = never evict. |
+| `POLYASR_IDLE_EVICT_SECONDS` | `180` | Evict the resident model(s) after this idle window. `0` = never evict. |
+| `POLYASR_COLOAD` | `1` | Co-load model units: `asr` and `align` may be resident at once so benchday's `asr` is never evicted by an `align`. `0` = one-model-resident (loading one evicts the other). |
 | `POLYASR_ALIGNER_MODEL` | `Qwen/Qwen3-ForcedAligner-0.6B` | CUDA forced aligner. |
 | `POLYASR_ALIGN_ASR_MODEL` | `mlx-community/Qwen3-ASR-0.6B-4bit` | MLX align ASR model. |
 | `POLYASR_ALIGN_ALIGNER_MODEL` | `mlx-community/Qwen3-ForcedAligner-0.6B-4bit` | MLX align aligner model. |
