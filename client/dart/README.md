@@ -1,6 +1,6 @@
 # asr_client
 
-Dart/Flutter client for [realtime-asr](../../README.md). Streams mic audio over WebSocket and surfaces partial/final transcriptions; falls back to the HTTP batch endpoint if the WebSocket drops.
+Dart/Flutter client for [polyasr](../../README.md). Streams mic audio over WebSocket and surfaces partial/final transcriptions; falls back to the HTTP batch endpoint if the WebSocket drops.
 
 ## Features
 
@@ -17,7 +17,7 @@ Dart/Flutter client for [realtime-asr](../../README.md). Streams mic audio over 
 dependencies:
   asr_client:
     git:
-      url: git@github.com:zigzag-tech/realtime-asr.git
+      url: git@github.com:zigzag-tech/polyasr.git
       path: client/dart
       ref: main  # or a commit SHA for reproducible builds
 ```

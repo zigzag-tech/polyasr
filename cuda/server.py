@@ -23,6 +23,7 @@ MLX server unchanged — per-session input.pcm → FLAC + events.jsonl.
 import os
 import sys
 import io
+import gc
 import json
 import time
 import uuid
@@ -41,46 +42,59 @@ import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+# Shared poly* modules live in the repo root; this server runs from cuda/.
+# Append (not insert) so the root-level MLX server.py never shadows this module
+# when uvicorn imports "server:app".
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+
+from polyasr_manager import AsrModelManager, ManagedUnit, free_cuda, trim_ram  # noqa: E402
+import polyasr_align  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("realtime-asr-cuda")
+log = logging.getLogger("polyasr-cuda")
+
+
+def _env(name: str, default: str) -> str:
+    """Read POLYASR_<name>, falling back to the legacy ASR_<name> so existing
+    systemd units keep working until they're updated."""
+    return os.environ.get(f"POLYASR_{name}") or os.environ.get(f"ASR_{name}", default)
+
+
+def _envflag(name: str, default: str) -> bool:
+    return _env(name, default).lower() not in {"0", "false", "no"}
+
 
 # 1.7B is the default on this node — the RTX 3090 has enough VRAM and
 # the better-quality 1.7B weights are why we're here instead of on MLX.
-MODEL_NAME = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
-DEVICE = os.environ.get("ASR_DEVICE", "cuda:0")
-DTYPE = os.environ.get("ASR_DTYPE", "bfloat16")  # bfloat16 | float16
-ASR_BACKEND = os.environ.get("ASR_BACKEND", "transformers").lower()
-ASR_NATIVE_STREAMING = os.environ.get(
-    "ASR_NATIVE_STREAMING",
-    "1" if ASR_BACKEND == "vllm" else "0",
-).lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_FINAL_WAIT_PARTIAL = os.environ.get("ASR_FINAL_WAIT_PARTIAL", "0").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_PARTIALS_ENABLED = os.environ.get("ASR_PARTIALS_ENABLED", "1").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_STREAM_CHUNK_SEC = float(os.environ.get("ASR_STREAM_CHUNK_SEC", "2.0"))
-FAKE_TRANSCRIBE = os.environ.get("ASR_FAKE_TRANSCRIBE", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-FAKE_TRANSCRIBE_DELAY_SEC = float(os.environ.get("ASR_FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
-_session = None
+MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-1.7B")
+DEVICE = _env("DEVICE", "cuda:0")
+DTYPE = _env("DTYPE", "bfloat16")  # bfloat16 | float16
+ASR_BACKEND = _env("BACKEND", "transformers").lower()
+# Forced aligner (loaded lazily by /v1/align as a separate managed unit).
+ALIGNER_MODEL = _env("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
+# Idle-evict the resident model after this many seconds (0 = never evict) so a
+# co-resident polytts/renderer can reclaim the GPU.
+IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
+ASR_NATIVE_STREAMING = (
+    _env("NATIVE_STREAMING", "1" if ASR_BACKEND == "vllm" else "0").lower()
+    not in {"0", "false", "no"}
+)
+ASR_FINAL_WAIT_PARTIAL = _envflag("FINAL_WAIT_PARTIAL", "0")
+ASR_PARTIALS_ENABLED = _envflag("PARTIALS_ENABLED", "1")
+ASR_STREAM_CHUNK_SEC = float(_env("STREAM_CHUNK_SEC", "2.0"))
+FAKE_TRANSCRIBE = _env("FAKE_TRANSCRIBE", "").lower() in {"1", "true", "yes"}
+FAKE_TRANSCRIBE_DELAY_SEC = float(_env("FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
 _vad_model = None
 _voice_encoder = None
+# Serializes every model load/unload/transcribe/align call. The idle-evict sweep
+# and POST /model/unload also take this lock so eviction never races an in-flight
+# transcription. get_session()/manager.ensure() are always called while holding
+# it (or from within a run_transcribe closure that holds it).
 _transcribe_lock = threading.Lock()
 
 # -------------------------------------------------------------------------
@@ -89,7 +103,7 @@ _transcribe_lock = threading.Lock()
 # by setting ASR_LOG_DIR="". Raw PCM is written incrementally (crash-safe)
 # and converted to FLAC (lossless, ~60% of WAV size) at session close.
 # -------------------------------------------------------------------------
-_log_dir_env = os.environ.get("ASR_LOG_DIR", "logs")
+_log_dir_env = _env("LOG_DIR", "logs")
 if _log_dir_env:
     _p = Path(_log_dir_env)
     LOG_DIR = _p if _p.is_absolute() else Path(__file__).parent / _p
@@ -109,7 +123,7 @@ ASR_PROTOCOL_VERSION = 1
 ASR_FRAME_MAGIC = b"BASR"
 ASR_FRAME_HEADER_BYTES = 16
 ASR_FRAME_TYPE_AUDIO = 1
-ASR_RESUME_TTL_SEC = float(os.environ.get("ASR_RESUME_TTL_SEC", "300"))
+ASR_RESUME_TTL_SEC = float(_env("RESUME_TTL_SEC", "300"))
 
 
 class AsrProtocolSession:
@@ -231,33 +245,65 @@ def _torch_dtype():
     )
 
 
-def get_session():
-    global _session
-    if _session is None:
-        log.info(
-            "Loading model %s on %s (%s, backend=%s) ...",
+def _load_asr_model():
+    """Loader for the streaming/batch ASR model (managed unit 'asr')."""
+    log.info(
+        "Loading model %s on %s (%s, backend=%s) ...",
+        MODEL_NAME, DEVICE, DTYPE, ASR_BACKEND,
+    )
+    from qwen_asr import Qwen3ASRModel
+    if ASR_BACKEND == "vllm":
+        model = Qwen3ASRModel.LLM(MODEL_NAME, dtype=DTYPE, max_new_tokens=512)
+    else:
+        import torch  # noqa: F401 — used indirectly via dtype
+        model = Qwen3ASRModel.from_pretrained(
             MODEL_NAME,
-            DEVICE,
-            DTYPE,
-            ASR_BACKEND,
+            dtype=_torch_dtype(),
+            device_map=DEVICE,
+            max_new_tokens=512,
         )
-        from qwen_asr import Qwen3ASRModel
-        if ASR_BACKEND == "vllm":
-            _session = Qwen3ASRModel.LLM(
-                MODEL_NAME,
-                dtype=DTYPE,
-                max_new_tokens=512,
-            )
-        else:
-            import torch  # noqa: F401 — used indirectly via dtype
-            _session = Qwen3ASRModel.from_pretrained(
-                MODEL_NAME,
-                dtype=_torch_dtype(),
-                device_map=DEVICE,
-                max_new_tokens=512,
-            )
-        log.info("Model loaded successfully.")
-    return _session
+    log.info("ASR model loaded successfully.")
+    return model
+
+
+def _load_align_model():
+    """Loader for the forced-alignment model (managed unit 'align'): an ASR
+    model bundled with the forced aligner so transcribe(return_time_stamps=True)
+    emits per-char timestamps."""
+    log.info("Loading aligner %s + %s on %s ...", MODEL_NAME, ALIGNER_MODEL, DEVICE)
+    import torch
+    from qwen_asr import Qwen3ASRModel
+    model = Qwen3ASRModel.from_pretrained(
+        MODEL_NAME,
+        dtype=_torch_dtype(),
+        device_map=DEVICE,
+        # Dense Chinese narration in a 270s chunk can be ~600-1200 chars; 256
+        # silently truncated. Match unchain's qwen3_asr.py budget.
+        max_new_tokens=2048,
+        forced_aligner=ALIGNER_MODEL,
+        forced_aligner_kwargs=dict(dtype=_torch_dtype(), device_map=DEVICE),
+    )
+    log.info("Aligner model loaded successfully.")
+    return model
+
+
+# One-model-in-VRAM manager: the 'asr' and 'align' units never co-reside;
+# loading one evicts the other, and the resident unit is idle-evicted so a
+# co-resident polytts/renderer can reclaim the GPU.
+manager = AsrModelManager(
+    {
+        "asr": ManagedUnit("asr", _load_asr_model, free_cuda),
+        "align": ManagedUnit("align", _load_align_model, free_cuda),
+    },
+    IDLE_EVICT_SECONDS,
+)
+
+
+def get_session():
+    """Return the resident ASR model, loading it (and evicting any other unit)
+    if needed. Resets the idle timer. Call only from the GPU executor thread or
+    code already holding _transcribe_lock."""
+    return manager.ensure("asr")
 
 
 def get_vad():
@@ -489,7 +535,8 @@ def rms_energy(pcm_data: bytes) -> float:
 def native_streaming_available() -> bool:
     if not ASR_NATIVE_STREAMING or FAKE_TRANSCRIBE:
         return False
-    session = get_session()
+    with _transcribe_lock:
+        session = get_session()
     return all(
         hasattr(session, name)
         for name in (
@@ -501,7 +548,8 @@ def native_streaming_available() -> bool:
 
 
 def init_native_stream(context: str):
-    session = get_session()
+    with _transcribe_lock:
+        session = get_session()
     return session.init_streaming_state(
         context=context or "",
         chunk_size_sec=ASR_STREAM_CHUNK_SEC,
@@ -563,18 +611,40 @@ def _flatten_result_language(result) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-app = FastAPI(title="realtime-asr (CUDA)", version="2.0.0")
+app = FastAPI(title="polyasr (CUDA)", version="2.0.0")
+
+
+async def _idle_evict_loop():
+    """Sweep every ~10s; evict the resident model once idle past the timeout so
+    the GPU is freed for a co-resident polytts/renderer. Takes _transcribe_lock
+    so eviction never races an in-flight transcription."""
+    if IDLE_EVICT_SECONDS <= 0:
+        return
+    loop = asyncio.get_event_loop()
+
+    def sweep():
+        with _transcribe_lock:
+            return manager.maybe_evict()
+
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await loop.run_in_executor(None, sweep)
+        except Exception:
+            log.exception("idle-evict sweep failed")
 
 
 @app.on_event("startup")
 async def startup_event():
     if FAKE_TRANSCRIBE:
-        log.info("ASR_FAKE_TRANSCRIBE enabled; skipping model/VAD/encoder preload.")
+        log.info("POLYASR_FAKE_TRANSCRIBE enabled; skipping model/VAD/encoder preload.")
         return
-    log.info("Pre-loading ASR model at startup...")
-    get_session()
+    log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
+    with _transcribe_lock:
+        get_session()
     get_vad()
     get_encoder()
+    asyncio.create_task(_idle_evict_loop())
     log.info("Server ready.")
 
 
@@ -593,7 +663,23 @@ async def health():
     except Exception:
         pass
     return {"status": "ok", "model": MODEL_NAME, "backend": "cuda",
-            "dtype": DTYPE, "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu}
+            "dtype": DTYPE, "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
+            "manager": manager.status()}
+
+
+@app.post("/model/unload")
+async def model_unload():
+    """Force-evict the resident model from VRAM (and return freed heap to the
+    OS) without stopping the server, so a co-resident workload can reclaim the
+    GPU. The model reloads lazily on the next transcribe/align."""
+    loop = asyncio.get_event_loop()
+
+    def do_unload():
+        with _transcribe_lock:
+            return manager.unload_now()
+
+    evicted = await loop.run_in_executor(None, do_unload)
+    return {"unloaded": evicted, "manager": manager.status()}
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +702,6 @@ async def transcribe(
         tmp.flush()
         tmp.close()
 
-        session = get_session()
         kwargs = {"audio": tmp.name}
         if language:
             kwargs["language"] = language
@@ -625,7 +710,7 @@ async def transcribe(
         loop = asyncio.get_event_loop()
         def run_transcribe():
             with _transcribe_lock:
-                return session.transcribe(**kwargs)
+                return get_session().transcribe(**kwargs)
 
         result = await loop.run_in_executor(None, run_transcribe)
         text = _flatten_result_text(result)
@@ -657,23 +742,119 @@ async def transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Forced-alignment endpoint (port of unchain scripts/python/qwen3_asr.py)
+# ---------------------------------------------------------------------------
+def _align_cuda(audio_path: Path, language: Optional[str], max_chunk_seconds: int) -> dict:
+    """Run the forced aligner over the audio (chunked ≤ max_chunk_seconds) and
+    return the shared forced-alignment JSON schema. Runs on a worker thread
+    while holding _transcribe_lock (load + per-chunk transcribe serialized)."""
+    merged_text_parts: list[str] = []
+    merged_segments: list[dict] = []
+    detected_language: Optional[str] = None
+    norm = polyasr_align.normalize_language(language)
+
+    with _transcribe_lock:
+        model = manager.ensure("align")
+        for chunk_idx, offset, chunk_path in polyasr_align.load_audio_chunks(
+            audio_path, max_chunk_seconds
+        ):
+            log.info("align chunk %d: offset=%.1fs file=%s",
+                     chunk_idx, offset, chunk_path.name)
+            kwargs = {"audio": str(chunk_path), "return_time_stamps": True}
+            if norm:
+                kwargs["language"] = norm
+            results = model.transcribe(**kwargs)
+            if not results:
+                continue
+            r = results[0]
+            chunk_text = r.text or ""
+            if not detected_language:
+                detected_language = getattr(r, "language", None) or language or "auto"
+            merged_text_parts.append(chunk_text)
+
+            char_timings: list[dict] = []
+            for ts in (r.time_stamps or []):
+                t_text = getattr(ts, "text", None)
+                if t_text is None:
+                    t_text = ts.get("text", "")  # type: ignore[union-attr]
+                t_start = getattr(ts, "start_time", None)
+                if t_start is None:
+                    t_start = ts.get("start_time", 0.0)  # type: ignore[union-attr]
+                t_end = getattr(ts, "end_time", None)
+                if t_end is None:
+                    t_end = ts.get("end_time", t_start)  # type: ignore[union-attr]
+                char_timings.append({
+                    "text": t_text,
+                    "start": float(t_start) + offset,
+                    "end": float(t_end) + offset,
+                })
+
+            merged_segments.extend(
+                polyasr_align.group_chars_into_sentences(char_timings, chunk_text)
+            )
+        # The model stays resident; idle-evict reclaims it later.
+
+    return {
+        "text": "".join(merged_text_parts),
+        "language": detected_language or language or "auto",
+        "segments": merged_segments,
+        "model": f"{MODEL_NAME} + {ALIGNER_MODEL}",
+    }
+
+
+@app.post("/v1/align")
+async def align(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    max_chunk_seconds: int = Form(270),
+    model: Optional[str] = Form(None),
+):
+    """Forced alignment: returns text + per-sentence segments with per-char word
+    timestamps ({text,start,end}). `model` is accepted for API symmetry but the
+    server's configured POLYASR_MODEL/POLYASR_ALIGNER_MODEL are authoritative."""
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
+        result = await loop.run_in_executor(
+            None, _align_cuda, Path(tmp.name), language, int(max_chunk_seconds)
+        )
+        log.info("Aligned in %.2fs: %d segments, %d chars",
+                 time.monotonic() - t0, len(result["segments"]), len(result["text"]))
+        return JSONResponse(result)
+    except Exception as e:
+        log.exception("Alignment failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # WebSocket streaming endpoint
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 
 # Partial interval: how often to emit a live partial.
-PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
+PARTIAL_INTERVAL_SEC = float(_env("PARTIAL_INTERVAL_SEC", "0.6"))
 
 # Minimum new non-silent audio before scheduling another partial. This keeps
 # tiny audio dribbles from causing an expensive reparse of the same tail.
-PARTIAL_MIN_DELTA_SEC = float(os.environ.get("ASR_PARTIAL_MIN_DELTA_SEC", "0.5"))
+PARTIAL_MIN_DELTA_SEC = float(_env("PARTIAL_MIN_DELTA_SEC", "0.5"))
 PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
 # sentences; the final pass still transcribes the full utterance.
-PARTIAL_WINDOW_SEC = float(os.environ.get("ASR_PARTIAL_WINDOW_SEC", "20.0"))
+PARTIAL_WINDOW_SEC = float(_env("PARTIAL_WINDOW_SEC", "20.0"))
 PARTIAL_WINDOW_BYTES = int(PARTIAL_WINDOW_SEC * BYTES_PER_SEC)
 
 # VAD windowing: 160ms analysis windows (5 Silero chunks each).
@@ -1026,6 +1207,10 @@ async def ws_transcribe(ws: WebSocket):
                     })
                     continue
                 slog.audio(audio_bytes)
+                # Keep the ASR model resident for the life of an active
+                # dictation: every audio frame resets the idle timer so a long
+                # pause mid-session can't trigger an idle-evict.
+                manager.touch()
                 raw_audio.extend(audio_bytes)
                 if pcm_has_signal(audio_bytes):
                     raw_partial_audio.extend(audio_bytes)
@@ -1280,14 +1465,13 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
         return " ".join(f"fake{idx + 1}" for idx in range(buckets))
     wav = pcm_to_float32(bytes(audio_buffer))
     try:
-        session = get_session()
         loop = asyncio.get_event_loop()
         kwargs = {"audio": (wav, SAMPLE_RATE)}
         if context:
             kwargs["context"] = context
         def run_transcribe():
             with _transcribe_lock:
-                return session.transcribe(**kwargs)
+                return get_session().transcribe(**kwargs)
 
         result = await loop.run_in_executor(None, run_transcribe)
         return _flatten_result_text(result)
@@ -1300,6 +1484,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=int(os.environ.get("ASR_PORT", "8765")),
+        port=int(_env("PORT", "8766")),
         log_level="info",
     )

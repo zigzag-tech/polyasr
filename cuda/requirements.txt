@@ -2,12 +2,15 @@
 # Target: zz-tower0 (RTX 3090, CUDA 13). PyTorch CUDA wheels must match the
 # local CUDA runtime — install torch separately via the cu12x index.
 
-# ASR model (PyTorch/CUDA) — first-party from the Qwen team.
+# ASR model (PyTorch/CUDA) — first-party from the Qwen team. Also provides the
+# Qwen3-ForcedAligner integration used by the /v1/align endpoint
+# (Qwen3ASRModel(..., forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")).
 qwen-asr
 # Optional native streaming backend: install `qwen-asr[vllm]` and run with
-# ASR_BACKEND=vllm after verifying disk space and GPU memory on the host.
+# POLYASR_BACKEND=vllm after verifying disk space and GPU memory on the host.
 
-# Audio I/O + numerics
+# Audio I/O + numerics. ffmpeg (system binary) is required by /v1/align for
+# decoding non-WAV uploads + chunking long audio.
 soundfile
 numpy
 

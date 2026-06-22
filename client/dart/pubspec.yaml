@@ -1,5 +1,5 @@
 name: asr_client
-description: Dart/Flutter client for the realtime-asr streaming ASR service.
+description: Dart/Flutter client for the polyasr streaming ASR service.
 version: 0.1.0
 publish_to: none
 

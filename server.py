@@ -38,16 +38,40 @@ import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+# Shared poly* modules live alongside this MLX server in the repo root.
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+from polyasr_manager import AsrModelManager, ManagedUnit, free_mlx, trim_ram  # noqa: E402
+import polyasr_align  # noqa: E402
+
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("asr-server")
+log = logging.getLogger("polyasr")
 
-MODEL_NAME = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
-_session = None
+
+def _env(name: str, default: str) -> str:
+    """Read POLYASR_<name>, falling back to the legacy ASR_<name> so existing
+    launchd units keep working until they're updated."""
+    return os.environ.get(f"POLYASR_{name}") or os.environ.get(f"ASR_{name}", default)
+
+
+def _envflag(name: str, default: str) -> bool:
+    return _env(name, default).lower() not in {"0", "false", "no"}
+
+
+MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-0.6B")
+# MLX forced-alignment models (loaded lazily by /v1/align). The aligner needs an
+# ASR model + a separate forced-aligner model, both via mlx_audio.stt.
+ALIGN_ASR_MODEL = _env("ALIGN_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-4bit")
+ALIGN_ALIGNER_MODEL = _env("ALIGN_ALIGNER_MODEL", "mlx-community/Qwen3-ForcedAligner-0.6B-4bit")
+# Idle-evict the resident model after this many seconds (0 = never evict) so a
+# co-resident polytts/renderer can reclaim the GPU/Metal memory.
+IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
 _vad_model = None
 _voice_encoder = None
 _transcribe_lock = threading.Lock()
@@ -58,7 +82,7 @@ _last_transcribe_monotonic = 0.0
 # MLX allocates Metal buffers aggressively and never returns them to the OS.
 # Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
 # cache after every transcription so memory stays bounded.
-ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
+ASR_MAX_NEW_TOKENS = int(_env("MAX_NEW_TOKENS", "256"))
 # A short or near-silent clip must never run the decoder out to the full token
 # budget. Low-signal audio makes ASR models loop/hallucinate until
 # max_new_tokens, which on a contended MLX GPU can take 20-30s — long enough to
@@ -67,32 +91,20 @@ ASR_MAX_NEW_TOKENS = int(os.environ.get("ASR_MAX_NEW_TOKENS", "256"))
 # all of them behind it. Cap tokens by audio length; 25 tok/s is 4-8x real
 # speech, so legitimate transcripts are never truncated (long clips still hit
 # the 256 ceiling unchanged — only short clips get a tighter, safer bound).
-ASR_MIN_NEW_TOKENS = int(os.environ.get("ASR_MIN_NEW_TOKENS", "32"))
-ASR_TOKENS_PER_AUDIO_SEC = int(os.environ.get("ASR_TOKENS_PER_AUDIO_SEC", "25"))
+ASR_MIN_NEW_TOKENS = int(_env("MIN_NEW_TOKENS", "32"))
+ASR_TOKENS_PER_AUDIO_SEC = int(_env("TOKENS_PER_AUDIO_SEC", "25"))
 # Keep the MLX model/Metal kernels hot. After an idle gap the first inference
 # takes ~9s (vs ~0.6s warm) — long enough that the first streaming partial
 # misses the client's ~10s no-partial timeout, so live text never appears on
 # the first dictation after a lull (only the batch fallback delivers, at stop).
 # A tiny periodic warmup during idle gaps keeps it resident. 0 disables.
-ASR_KEEPWARM_INTERVAL_SEC = float(os.environ.get("ASR_KEEPWARM_INTERVAL_SEC", "45"))
-ASR_NATIVE_STREAMING = os.environ.get("ASR_NATIVE_STREAMING", "0").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_FINAL_WAIT_PARTIAL = os.environ.get("ASR_FINAL_WAIT_PARTIAL", "0").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_PARTIALS_ENABLED = os.environ.get("ASR_PARTIALS_ENABLED", "0").lower() not in {
-    "0",
-    "false",
-    "no",
-}
-ASR_STREAM_CHUNK_SEC = float(os.environ.get("ASR_STREAM_CHUNK_SEC", "2.0"))
-ASR_STREAM_MAX_CONTEXT_SEC = float(os.environ.get("ASR_STREAM_MAX_CONTEXT_SEC", "30.0"))
-ASR_STREAM_FINALIZATION_MODE = os.environ.get("ASR_STREAM_FINALIZATION_MODE", "latency")
+ASR_KEEPWARM_INTERVAL_SEC = float(_env("KEEPWARM_INTERVAL_SEC", "45"))
+ASR_NATIVE_STREAMING = _envflag("NATIVE_STREAMING", "0")
+ASR_FINAL_WAIT_PARTIAL = _envflag("FINAL_WAIT_PARTIAL", "0")
+ASR_PARTIALS_ENABLED = _envflag("PARTIALS_ENABLED", "0")
+ASR_STREAM_CHUNK_SEC = float(_env("STREAM_CHUNK_SEC", "2.0"))
+ASR_STREAM_MAX_CONTEXT_SEC = float(_env("STREAM_MAX_CONTEXT_SEC", "30.0"))
+ASR_STREAM_FINALIZATION_MODE = _env("STREAM_FINALIZATION_MODE", "latency")
 
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
@@ -100,7 +112,7 @@ ASR_STREAM_FINALIZATION_MODE = os.environ.get("ASR_STREAM_FINALIZATION_MODE", "l
 # by setting ASR_LOG_DIR="". Raw PCM is written incrementally (crash-safe)
 # and converted to FLAC (lossless, ~60% of WAV size) at session close.
 # -------------------------------------------------------------------------
-_log_dir_env = os.environ.get("ASR_LOG_DIR", "logs")
+_log_dir_env = _env("LOG_DIR", "logs")
 if _log_dir_env:
     _p = Path(_log_dir_env)
     LOG_DIR = _p if _p.is_absolute() else Path(__file__).parent / _p
@@ -120,7 +132,7 @@ ASR_PROTOCOL_VERSION = 1
 ASR_FRAME_MAGIC = b"BASR"
 ASR_FRAME_HEADER_BYTES = 16
 ASR_FRAME_TYPE_AUDIO = 1
-ASR_RESUME_TTL_SEC = float(os.environ.get("ASR_RESUME_TTL_SEC", "300"))
+ASR_RESUME_TTL_SEC = float(_env("RESUME_TTL_SEC", "300"))
 
 
 class AsrProtocolSession:
@@ -236,14 +248,43 @@ def _decode_protocol_audio_frame(frame: bytes):
     return seq, frame[ASR_FRAME_HEADER_BYTES:]
 
 
+def _load_asr_model():
+    """Loader for the streaming/batch ASR model (managed unit 'asr')."""
+    log.info("Loading model %s ...", MODEL_NAME)
+    import mlx_qwen3_asr
+    session = mlx_qwen3_asr.Session(MODEL_NAME)
+    log.info("ASR model loaded successfully.")
+    return session
+
+
+def _load_align_models():
+    """Loader for the forced-alignment unit 'align': an MLX ASR model plus a
+    separate MLX forced-aligner model (both via mlx_audio.stt.load_model).
+    Returns (asr_model, aligner_model)."""
+    log.info("Loading MLX aligner: %s + %s ...", ALIGN_ASR_MODEL, ALIGN_ALIGNER_MODEL)
+    from mlx_audio.stt.utils import load_model as load_stt_model
+    asr_model = load_stt_model(ALIGN_ASR_MODEL)
+    aligner_model = load_stt_model(ALIGN_ALIGNER_MODEL)
+    log.info("MLX aligner models loaded.")
+    return (asr_model, aligner_model)
+
+
+# One-model-in-VRAM manager: 'asr' (streaming/batch) and 'align' (forced
+# alignment) never co-reside; loading one evicts the other, and the resident
+# unit is idle-evicted so a co-resident polytts/renderer can reclaim memory.
+manager = AsrModelManager(
+    {
+        "asr": ManagedUnit("asr", _load_asr_model, free_mlx),
+        "align": ManagedUnit("align", _load_align_models, free_mlx),
+    },
+    IDLE_EVICT_SECONDS,
+)
+
+
 def get_session():
-    global _session
-    if _session is None:
-        log.info("Loading model %s ...", MODEL_NAME)
-        import mlx_qwen3_asr
-        _session = mlx_qwen3_asr.Session(MODEL_NAME)
-        log.info("Model loaded successfully.")
-    return _session
+    """Return the resident ASR session, loading it (evicting any other unit) if
+    needed. Resets the idle timer. Call from within _transcribe_lock."""
+    return manager.ensure("asr")
 
 
 def get_vad():
@@ -477,7 +518,8 @@ def pcm16_to_float32(pcm_data: bytes) -> np.ndarray:
 def native_streaming_available() -> bool:
     if not ASR_NATIVE_STREAMING:
         return False
-    session = get_session()
+    with _transcribe_lock:
+        session = get_session()
     return all(
         hasattr(session, name)
         for name in ("init_streaming", "feed_audio", "finish_streaming")
@@ -485,7 +527,8 @@ def native_streaming_available() -> bool:
 
 
 def init_native_stream(context: str):
-    session = get_session()
+    with _transcribe_lock:
+        session = get_session()
     return session.init_streaming(
         context=context or "",
         chunk_size_sec=ASR_STREAM_CHUNK_SEC,
@@ -526,13 +569,14 @@ async def finish_native_stream(state) -> str:
 
 
 # ---------------------------------------------------------------------------
-app = FastAPI(title="MuxPod ASR Server", version="2.0.0")
+app = FastAPI(title="polyasr (MLX)", version="2.0.0")
 
 
 @app.on_event("startup")
 async def startup_event():
-    log.info("Pre-loading ASR model at startup...")
-    get_session()
+    log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
+    with _transcribe_lock:
+        get_session()
     get_vad()
     get_encoder()
     log.info(
@@ -552,12 +596,37 @@ async def startup_event():
     except Exception:
         log.exception("Startup warmup failed")
     asyncio.create_task(_keepwarm_loop())
+    asyncio.create_task(_idle_evict_loop())
     log.info("Server ready.")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "memory_mb": {
+            "active": round(mx.get_active_memory() / 1024 / 1024),
+            "peak": round(mx.get_peak_memory() / 1024 / 1024),
+            "cache": round(mx.get_cache_memory() / 1024 / 1024),
+        },
+        "manager": manager.status(),
+    }
+
+
+@app.post("/model/unload")
+async def model_unload():
+    """Force-evict the resident model from Metal memory (and return freed heap to
+    the OS) without stopping the server, so a co-resident polytts/renderer can
+    reclaim memory. The model reloads lazily on the next transcribe/align."""
+    loop = asyncio.get_event_loop()
+
+    def do_unload():
+        with _transcribe_lock:
+            return manager.unload_now()
+
+    evicted = await loop.run_in_executor(None, do_unload)
+    return {"unloaded": evicted, "manager": manager.status()}
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +649,6 @@ async def transcribe(
         tmp.flush()
         tmp.close()
 
-        session = get_session()
         # Bound decoder length by audio duration (see _transcribe_buffer): a
         # short/low-signal upload must not run away to the full token budget and
         # stall the shared transcribe lock. Best-effort WAV duration; fall back
@@ -605,7 +673,7 @@ async def transcribe(
         if context:
             kwargs["context"] = context
         with _transcribe_lock:
-            result = session.transcribe(tmp.name, **kwargs)
+            result = get_session().transcribe(tmp.name, **kwargs)
         _clear_mlx_cache()
 
         elapsed = time.monotonic() - t0
@@ -635,23 +703,146 @@ async def transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Forced-alignment endpoint (port of unchain scripts/python/mlx_qwen3_asr.py)
+# ---------------------------------------------------------------------------
+def _mlx_asr_lang(asr_out) -> str:
+    """STTOutput.language may be str or list of per-segment langs."""
+    raw = getattr(asr_out, "language", None)
+    if isinstance(raw, list) and raw:
+        return str(raw[0])
+    if isinstance(raw, str) and raw:
+        return raw
+    return "Chinese"
+
+
+def _align_mlx(audio_path: Path, language: Optional[str], max_chunk_seconds: int) -> dict:
+    """Two-model MLX forced alignment (ASR then aligner) with the 85%-coverage
+    fallback. Returns the shared forced-alignment JSON schema. Holds
+    _transcribe_lock so model load + per-chunk generate are serialized."""
+    norm_hint = polyasr_align.normalize_language(language)
+    merged_text_parts: list[str] = []
+    merged_segments: list[dict] = []
+    detected_language: Optional[str] = None
+
+    with _transcribe_lock:
+        asr_model, align_model = manager.ensure("align")
+        for chunk_idx, offset, chunk_path in polyasr_align.load_audio_chunks(
+            audio_path, max_chunk_seconds
+        ):
+            log.info("align chunk %d: offset=%.1fs file=%s",
+                     chunk_idx, offset, chunk_path.name)
+            asr_kwargs = {"chunk_duration": float(max_chunk_seconds), "verbose": False}
+            if norm_hint:
+                asr_kwargs["language"] = norm_hint
+            asr_out = asr_model.generate(str(chunk_path), **asr_kwargs)
+            chunk_text = (asr_out.text or "").strip()
+            if not chunk_text:
+                log.info("align chunk %d: empty ASR text; skipping aligner", chunk_idx)
+                continue
+
+            merged_text_parts.append(chunk_text)
+            align_lang = _mlx_asr_lang(asr_out)
+            if not detected_language:
+                detected_language = align_lang
+
+            al = align_model.generate(str(chunk_path), text=chunk_text, language=align_lang)
+            if isinstance(al, list):
+                al = al[0]
+
+            char_timings: list[dict] = []
+            for it in al.items:
+                char_timings.append({
+                    "text": it.text,
+                    "start": float(it.start_time) + offset,
+                    "end": float(it.end_time) + offset,
+                })
+
+            segs = polyasr_align.group_chars_into_sentences(char_timings, chunk_text)
+            cov = sum(len(s["text"]) for s in segs) if segs else 0
+            if not segs or cov < max(1, int(len(chunk_text) * 0.85)):
+                # group_chars can drop most text when aligner spans don't match
+                # punctuation boundaries; fall back to one segment with full
+                # chunk_text + char words.
+                if char_timings:
+                    words = [
+                        {"text": x["text"], "start": x["start"], "end": x["end"]}
+                        for x in char_timings
+                    ]
+                    merged_segments.append({
+                        "text": chunk_text,
+                        "start": words[0]["start"],
+                        "end": words[-1]["end"],
+                        "words": words,
+                    })
+                else:
+                    merged_segments.append({
+                        "text": chunk_text, "start": offset, "end": offset, "words": [],
+                    })
+            else:
+                merged_segments.extend(segs)
+        _clear_mlx_cache()
+
+    return {
+        "text": "".join(merged_text_parts),
+        "language": detected_language or language or "zh",
+        "segments": merged_segments,
+        "model": f"{ALIGN_ASR_MODEL} + {ALIGN_ALIGNER_MODEL} (MLX)",
+    }
+
+
+@app.post("/v1/align")
+async def align(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    max_chunk_seconds: int = Form(270),
+    model: Optional[str] = Form(None),
+):
+    """Forced alignment: returns text + per-sentence segments with per-char word
+    timestamps ({text,start,end}). `model` is accepted for API symmetry but the
+    server's configured align models are authoritative."""
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
+        result = await loop.run_in_executor(
+            None, _align_mlx, Path(tmp.name), language, int(max_chunk_seconds)
+        )
+        log.info("Aligned in %.2fs: %d segments, %d chars",
+                 time.monotonic() - t0, len(result["segments"]), len(result["text"]))
+        return JSONResponse(result)
+    except Exception as e:
+        log.exception("Alignment failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # WebSocket streaming endpoint
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2  # 16-bit mono
 
 # Partial interval: how often to emit a live partial.
-PARTIAL_INTERVAL_SEC = float(os.environ.get("ASR_PARTIAL_INTERVAL_SEC", "0.6"))
+PARTIAL_INTERVAL_SEC = float(_env("PARTIAL_INTERVAL_SEC", "0.6"))
 
 # Minimum new non-silent audio before scheduling another partial. This keeps
 # tiny audio dribbles from causing an expensive reparse of the same tail.
-PARTIAL_MIN_DELTA_SEC = float(os.environ.get("ASR_PARTIAL_MIN_DELTA_SEC", "0.5"))
+PARTIAL_MIN_DELTA_SEC = float(_env("PARTIAL_MIN_DELTA_SEC", "0.5"))
 PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
 # sentences; the final pass still transcribes the full utterance.
-PARTIAL_WINDOW_SEC = float(os.environ.get("ASR_PARTIAL_WINDOW_SEC", "20.0"))
+PARTIAL_WINDOW_SEC = float(_env("PARTIAL_WINDOW_SEC", "20.0"))
 PARTIAL_WINDOW_BYTES = int(PARTIAL_WINDOW_SEC * BYTES_PER_SEC)
 
 # VAD windowing: 160ms analysis windows (5 Silero chunks each).
@@ -1021,6 +1212,10 @@ async def ws_transcribe(ws: WebSocket):
                     })
                     continue
                 slog.audio(audio_bytes)
+                # Keep the ASR model resident for the life of an active
+                # dictation: every audio frame resets the idle timer so a long
+                # pause mid-session can't trigger an idle-evict.
+                manager.touch()
                 raw_audio.extend(audio_bytes)
                 if pcm_has_signal(audio_bytes):
                     raw_partial_audio.extend(audio_bytes)
@@ -1270,11 +1465,37 @@ async def ws_transcribe(ws: WebSocket):
             log.exception("Session logger close failed")
 
 
+async def _idle_evict_loop():
+    """Sweep every ~10s; evict the resident model once idle past the timeout so
+    a co-resident polytts/renderer can reclaim memory. Takes _transcribe_lock so
+    eviction never races an in-flight transcription."""
+    if IDLE_EVICT_SECONDS <= 0:
+        return
+    loop = asyncio.get_event_loop()
+
+    def sweep():
+        with _transcribe_lock:
+            return manager.maybe_evict()
+
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await loop.run_in_executor(None, sweep)
+        except Exception:
+            log.exception("idle-evict sweep failed")
+
+
 async def _keepwarm_loop():
     """Run a tiny inference during idle gaps so the model/Metal kernels stay
     hot and the first real partial after a lull isn't ~9s (which would miss the
     client's no-partial timeout). Skips itself whenever real traffic already
-    kept the model warm within the interval."""
+    kept the model warm within the interval.
+
+    Idle-evict wins: when POLYASR_IDLE_EVICT_SECONDS > 0, keep-warm must not
+    keep the model resident or it would defeat eviction. It therefore (a) only
+    warms a model that is ALREADY resident (never resurrects an evicted one) and
+    (b) restores the manager idle timer afterwards so the warmup itself does not
+    count as use. With idle-evict disabled it behaves as before."""
     if ASR_KEEPWARM_INTERVAL_SEC <= 0:
         return
     silence = bytes(int(BYTES_PER_SEC * 0.3))
@@ -1282,9 +1503,15 @@ async def _keepwarm_loop():
         await asyncio.sleep(ASR_KEEPWARM_INTERVAL_SEC)
         if time.monotonic() - _last_transcribe_monotonic < ASR_KEEPWARM_INTERVAL_SEC:
             continue
+        if IDLE_EVICT_SECONDS > 0 and manager.resident != "asr":
+            # Model already evicted (or aligner is resident); don't resurrect it.
+            continue
         try:
             t0 = time.monotonic()
+            idle_before = manager.last_used
             await _transcribe_buffer(bytearray(silence))
+            if IDLE_EVICT_SECONDS > 0:
+                manager.last_used = idle_before  # don't let warmup reset idle-evict
             log.info("keepwarm tick (%.2fs)", time.monotonic() - t0)
         except Exception:
             log.exception("keepwarm transcription failed")
@@ -1300,7 +1527,6 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
         tmp.write(wav_bytes)
         tmp.flush()
         tmp.close()
-        session = get_session()
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         # Bound decoder length by audio duration so a short/low-signal clip
@@ -1318,7 +1544,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
             kwargs["context"] = context
         def run_transcribe():
             with _transcribe_lock:
-                return session.transcribe(tmp.name, **kwargs)
+                return get_session().transcribe(tmp.name, **kwargs)
 
         result = await loop.run_in_executor(None, run_transcribe)
         _clear_mlx_cache()
@@ -1337,6 +1563,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=8765,
+        port=int(_env("PORT", "8765")),
         log_level="info",
     )

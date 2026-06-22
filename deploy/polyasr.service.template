@@ -1,5 +1,5 @@
 [Unit]
-Description=Realtime ASR server (CUDA / Qwen3-ASR)
+Description=polyasr server (CUDA / Qwen3-ASR + forced aligner)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,11 +8,15 @@ Type=simple
 User=__USER__
 Group=__GROUP__
 WorkingDirectory=__REPO__/cuda
-Environment=ASR_MODEL=Qwen/Qwen3-ASR-1.7B
-Environment=ASR_DEVICE=cuda:0
-Environment=ASR_DTYPE=bfloat16
-Environment=ASR_PORT=8766
-Environment=ASR_LOG_DIR=__REPO__/cuda/logs
+Environment=POLYASR_MODEL=Qwen/Qwen3-ASR-1.7B
+Environment=POLYASR_ALIGNER_MODEL=Qwen/Qwen3-ForcedAligner-0.6B
+Environment=POLYASR_DEVICE=cuda:0
+Environment=POLYASR_DTYPE=bfloat16
+Environment=POLYASR_PORT=8766
+Environment=POLYASR_LOG_DIR=__REPO__/cuda/logs
+# Idle-evict the resident model after this many seconds so a co-resident
+# polytts/renderer can reclaim the GPU. 0 disables (never evict).
+Environment=POLYASR_IDLE_EVICT_SECONDS=180
 # Hugging Face cache persists across restarts so model reload is fast.
 Environment=HF_HOME=__HF_HOME__
 # huggingface.co is unreachable from CN hosts (SSL EOF). Even via the mirror,
@@ -26,8 +30,8 @@ Environment=TRANSFORMERS_OFFLINE=1
 ExecStart=__REPO__/cuda/venv/bin/python __REPO__/cuda/server.py
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:__LOG_DIR__/realtime-asr-cuda.log
-StandardError=append:__LOG_DIR__/realtime-asr-cuda.err
+StandardOutput=append:__LOG_DIR__/polyasr.log
+StandardError=append:__LOG_DIR__/polyasr.err
 
 [Install]
 WantedBy=multi-user.target

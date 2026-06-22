@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.zigzag.realtime-asr</string>
+    <string>io.zigzag.polyasr</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -19,8 +19,12 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- Model: Qwen/Qwen3-ASR-0.6B (fast) or Qwen/Qwen3-ASR-1.7B (best) -->
-        <key>ASR_MODEL</key>
+        <key>POLYASR_MODEL</key>
         <string>Qwen/Qwen3-ASR-1.7B</string>
+        <!-- Idle-evict the resident model after N seconds so a co-resident
+             polytts/renderer can reclaim memory. 0 disables (never evict). -->
+        <key>POLYASR_IDLE_EVICT_SECONDS</key>
+        <string>180</string>
         <!-- Use HF mirror when huggingface.co is unreachable -->
         <key>HF_ENDPOINT</key>
         <string>https://hf-mirror.com</string>
