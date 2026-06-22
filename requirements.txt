@@ -1,8 +1,9 @@
 # ASR model (Apple Silicon MLX)
 mlx-qwen3-asr==0.3.5
 # Forced alignment for /v1/align: loads an MLX Qwen3-ASR model plus an MLX
-# Qwen3-ForcedAligner model via mlx_audio.stt.load_model.
-mlx-audio
+# Qwen3-ForcedAligner model via mlx_audio.stt.load_model. Verified on 0.4.4
+# (pulls mlx>=0.31.2, mlx-lm, transformers, tokenizers, safetensors, miniaudio).
+mlx-audio==0.4.4
 
 # Web framework
 fastapi==0.135.3
