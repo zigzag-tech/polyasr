@@ -49,7 +49,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
-from polyasr_manager import AsrModelManager, ManagedUnit, free_cuda, trim_ram  # noqa: E402
+from polycore import ModelManager as AsrModelManager, ManagedUnit, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 

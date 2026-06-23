@@ -26,3 +26,7 @@ Resemblyzer
 onnxruntime-gpu
 # Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
 pyannote.audio>=4.0
+
+# polycore — shared zero-dep model-residency seam (sibling repo ~/polycore).
+# Run pip from the polyasr repo root: pip install -r cuda/requirements.txt
+-e ../polycore

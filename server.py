@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 _REPO_ROOT = str(Path(__file__).resolve().parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
-from polyasr_manager import AsrModelManager, ManagedUnit, free_mlx, trim_ram  # noqa: E402
+from polycore import ModelManager as AsrModelManager, ManagedUnit, free_mlx, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 
@@ -93,7 +93,7 @@ _transcribe_lock = threading.Lock()
 # pool, so transcribe/load/warmup calls were landing on different threads and
 # corrupting the stream. Every MLX call — model load, warmup, partials, finals,
 # native streaming, unload, alignment — must run on this ONE thread (matches
-# the polyasr_manager design note: "all load/unload calls should run on a
+# the polycore.ModelManager design note: "all load/unload calls should run on a
 # single GPU executor thread, exactly like polytts").
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 _gpu_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")

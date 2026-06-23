@@ -28,3 +28,7 @@ numpy==2.4.4
 
 # Audio I/O (used for writing per-session FLAC archives)
 soundfile>=0.12.1
+
+# polycore — shared zero-dep model-residency seam (sibling repo ~/polycore).
+# Run pip from the polyasr repo root so the relative path resolves on every machine.
+-e ../polycore
