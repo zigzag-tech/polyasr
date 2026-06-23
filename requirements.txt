@@ -14,6 +14,8 @@ websockets==16.0
 # VAD and speaker embedding
 silero-vad==6.2.1
 Resemblyzer==0.1.4
+# Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
+pyannote.audio>=4.0
 onnxruntime==1.24.4
 torch==2.11.0
 torchaudio==2.11.0

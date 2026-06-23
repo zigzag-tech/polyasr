@@ -44,6 +44,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 from polyasr_manager import AsrModelManager, ManagedUnit, free_mlx, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
+import polyasr_diarize  # noqa: E402
 
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 
@@ -69,6 +70,10 @@ MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-0.6B")
 # ASR model + a separate forced-aligner model, both via mlx_audio.stt.
 ALIGN_ASR_MODEL = _env("ALIGN_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-4bit")
 ALIGN_ALIGNER_MODEL = _env("ALIGN_ALIGNER_MODEL", "mlx-community/Qwen3-ForcedAligner-0.6B-4bit")
+# Speaker-diarization unit (pyannote, loaded lazily by /v1/diarize). pyannote on
+# Apple Silicon MPS is flaky and Metal memory isn't returned to the OS on evict,
+# so default to CPU — idle-evict then actually reclaims via gc + malloc_trim.
+DIARIZE_DEVICE = _env("DIARIZE_DEVICE", "cpu")
 # Idle-evict the resident model after this many seconds (0 = never evict) so a
 # co-resident polytts/renderer can reclaim the GPU/Metal memory.
 IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
@@ -273,14 +278,28 @@ def _load_align_models():
     return (asr_model, aligner_model)
 
 
+def _load_diarize_model():
+    """Loader for the speaker-diarization unit 'diarize': a pyannote pipeline
+    (shared loader so the MLX and CUDA servers stay DRY). Runs on DIARIZE_DEVICE
+    (CPU by default on Apple Silicon)."""
+    log.info("Loading diarization pipeline: %s (device=%s) ...",
+             polyasr_diarize.DEFAULT_MODEL, DIARIZE_DEVICE)
+    pipeline = polyasr_diarize.load_pipeline(DIARIZE_DEVICE)
+    log.info("Diarization pipeline loaded.")
+    return pipeline
+
+
 # Model manager. With COLOAD on (default) 'asr' (streaming/batch) and 'align'
 # (forced alignment) co-reside so benchday's asr is never evicted by an unchain
-# align; with COLOAD off they never co-reside. Either way idle-evict reclaims
-# memory for a co-resident polytts/renderer.
+# align; with COLOAD off they never co-reside. The 'diarize' unit (pyannote) is
+# normally NOT loaded — it loads lazily on the first /v1/diarize call and is
+# idle-evicted like the others. Either way idle-evict reclaims memory for a
+# co-resident polytts/renderer.
 manager = AsrModelManager(
     {
         "asr": ManagedUnit("asr", _load_asr_model, free_mlx),
         "align": ManagedUnit("align", _load_align_models, free_mlx),
+        "diarize": ManagedUnit("diarize", _load_diarize_model, free_mlx),
     },
     IDLE_EVICT_SECONDS,
     coload=COLOAD,
@@ -878,6 +897,65 @@ async def align(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Alignment failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Speaker-diarization endpoint (pyannote, shared loader via polyasr_diarize)
+# ---------------------------------------------------------------------------
+def diarize_local_path(
+    path: Path,
+    num_speakers: Optional[int],
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> dict:
+    """Diarize one local audio file. Returns {segments:[{start,end,speaker}],
+    speakers, num_speakers}. Holds _transcribe_lock so the pipeline load + run
+    are serialized with the other managed units, exactly like align."""
+    with _transcribe_lock:
+        pipeline = manager.ensure("diarize")
+        result = polyasr_diarize.diarize(
+            pipeline, path, num_speakers, min_speakers, max_speakers
+        )
+        _clear_mlx_cache()
+    return result
+
+
+@app.post("/v1/diarize")
+async def diarize(
+    file: UploadFile = File(...),
+    num_speakers: Optional[int] = Form(None),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+):
+    """Speaker diarization (multipart upload). Returns speaker turns
+    `[{start, end, speaker}]` (sorted) plus the speaker label set. Pass
+    `num_speakers` when known, or `min_speakers`/`max_speakers` to bound it."""
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
+        result = await loop.run_in_executor(
+            None, diarize_local_path, Path(tmp.name),
+            num_speakers, min_speakers, max_speakers,
+        )
+        result["model"] = polyasr_diarize.DEFAULT_MODEL
+        log.info("Diarized in %.2fs: %d turns, %d speakers",
+                 time.monotonic() - t0, len(result["segments"]),
+                 result["num_speakers"])
+        return JSONResponse(result)
+    except Exception as e:
+        log.exception("Diarization failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:

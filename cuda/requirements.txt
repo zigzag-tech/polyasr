@@ -24,3 +24,5 @@ websockets
 silero-vad
 Resemblyzer
 onnxruntime-gpu
+# Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
+pyannote.audio>=4.0

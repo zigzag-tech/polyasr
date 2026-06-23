@@ -51,6 +51,7 @@ if _REPO_ROOT not in sys.path:
 
 from polyasr_manager import AsrModelManager, ManagedUnit, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
+import polyasr_diarize  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +78,9 @@ DTYPE = _env("DTYPE", "bfloat16")  # bfloat16 | float16
 ASR_BACKEND = _env("BACKEND", "transformers").lower()
 # Forced aligner (loaded lazily by /v1/align as a separate managed unit).
 ALIGNER_MODEL = _env("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
+# Speaker-diarization unit (pyannote, loaded lazily by /v1/diarize). Runs on the
+# GPU by default; override with POLYASR_DIARIZE_DEVICE (e.g. "cpu").
+DIARIZE_DEVICE = _env("DIARIZE_DEVICE", DEVICE)
 # Idle-evict the resident model after this many seconds (0 = never evict) so a
 # co-resident polytts/renderer can reclaim the GPU.
 IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
@@ -291,14 +295,28 @@ def _load_align_model():
     return model
 
 
+def _load_diarize_model():
+    """Loader for the speaker-diarization unit 'diarize': a pyannote pipeline
+    (shared loader so the MLX and CUDA servers stay DRY). Runs on DIARIZE_DEVICE
+    (the GPU by default)."""
+    log.info("Loading diarization pipeline: %s (device=%s) ...",
+             polyasr_diarize.DEFAULT_MODEL, DIARIZE_DEVICE)
+    pipeline = polyasr_diarize.load_pipeline(DIARIZE_DEVICE)
+    log.info("Diarization pipeline loaded.")
+    return pipeline
+
+
 # Model manager. With COLOAD on (default) the 'asr' and 'align' units co-reside
 # so benchday's asr is never evicted by an unchain align; with COLOAD off they
-# never co-reside (loading one evicts the other). Either way idle-evict reclaims
-# the GPU for a co-resident polytts/renderer.
+# never co-reside (loading one evicts the other). The 'diarize' unit (pyannote)
+# is normally NOT loaded — it loads lazily on the first /v1/diarize call and is
+# idle-evicted like the others. Either way idle-evict reclaims the GPU for a
+# co-resident polytts/renderer.
 manager = AsrModelManager(
     {
         "asr": ManagedUnit("asr", _load_asr_model, free_cuda),
         "align": ManagedUnit("align", _load_align_model, free_cuda),
+        "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda),
     },
     IDLE_EVICT_SECONDS,
     coload=COLOAD,
@@ -889,6 +907,63 @@ async def align(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Alignment failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Speaker-diarization endpoint (pyannote, shared loader via polyasr_diarize)
+# ---------------------------------------------------------------------------
+def diarize_local_path(
+    path: Path,
+    num_speakers: Optional[int],
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> dict:
+    """Diarize one local audio file. Returns {segments:[{start,end,speaker}],
+    speakers, num_speakers}. Holds _transcribe_lock so the pipeline load + run
+    are serialized with the other managed units, exactly like align."""
+    with _transcribe_lock:
+        pipeline = manager.ensure("diarize")
+        return polyasr_diarize.diarize(
+            pipeline, path, num_speakers, min_speakers, max_speakers
+        )
+
+
+@app.post("/v1/diarize")
+async def diarize(
+    file: UploadFile = File(...),
+    num_speakers: Optional[int] = Form(None),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+):
+    """Speaker diarization (multipart upload). Returns speaker turns
+    `[{start, end, speaker}]` (sorted) plus the speaker label set. Pass
+    `num_speakers` when known, or `min_speakers`/`max_speakers` to bound it."""
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
+        result = await loop.run_in_executor(
+            None, diarize_local_path, Path(tmp.name),
+            num_speakers, min_speakers, max_speakers,
+        )
+        result["model"] = polyasr_diarize.DEFAULT_MODEL
+        log.info("Diarized in %.2fs: %d turns, %d speakers",
+                 time.monotonic() - t0, len(result["segments"]),
+                 result["num_speakers"])
+        return JSONResponse(result)
+    except Exception as e:
+        log.exception("Diarization failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
