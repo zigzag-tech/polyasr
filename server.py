@@ -84,6 +84,30 @@ COLOAD = _envflag("COLOAD", "1")
 _vad_model = None
 _voice_encoder = None
 _transcribe_lock = threading.Lock()
+
+# Single dedicated GPU worker thread. MLX's Metal stream is THREAD-LOCAL: the
+# stream is created on whichever thread first evaluates a graph, and any later
+# op on a different thread raises "There is no Stream(gpu, N) in current
+# thread" (and can crash the process with a Metal "Invalid Resource" abort).
+# asyncio's default executor (run_in_executor(None, ...)) is a multi-thread
+# pool, so transcribe/load/warmup calls were landing on different threads and
+# corrupting the stream. Every MLX call — model load, warmup, partials, finals,
+# native streaming, unload, alignment — must run on this ONE thread (matches
+# the polyasr_manager design note: "all load/unload calls should run on a
+# single GPU executor thread, exactly like polytts").
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+_gpu_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+
+
+async def _run_on_gpu(fn, *args, **kwargs):
+    """Await a blocking MLX call on the single GPU worker thread."""
+    loop = asyncio.get_event_loop()
+    if kwargs:
+        from functools import partial as _partial
+        fn = _partial(fn, **kwargs)
+    return await loop.run_in_executor(_gpu_executor, fn, *args)
+
+
 # Monotonic timestamp of the most recent transcription, used by the keep-warm
 # loop to skip warmups when real traffic is already keeping the model hot.
 _last_transcribe_monotonic = 0.0
@@ -575,7 +599,7 @@ async def feed_native_stream(state, pcm_data: bytes) -> str:
         with _transcribe_lock:
             return get_session().feed_audio(pcm, state)
 
-    await loop.run_in_executor(None, run_feed)
+    await _run_on_gpu(run_feed)
     return (getattr(state, "text", "") or "").strip()
 
 
@@ -588,7 +612,7 @@ async def finish_native_stream(state) -> str:
         with _transcribe_lock:
             return get_session().finish_streaming(state)
 
-    await loop.run_in_executor(None, run_finish)
+    await _run_on_gpu(run_finish)
     _clear_mlx_cache()
     return (getattr(state, "text", "") or "").strip()
 
@@ -600,8 +624,14 @@ app = FastAPI(title="polyasr (MLX)", version="2.0.0")
 @app.on_event("startup")
 async def startup_event():
     log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
-    with _transcribe_lock:
-        get_session()
+
+    # Load the model ON the GPU worker thread so the MLX Metal stream is created
+    # there, not on the event-loop thread. Every later eval also runs on this
+    # thread, so the stream is always found (see _gpu_executor).
+    def _load_asr():
+        with _transcribe_lock:
+            get_session()
+    await _run_on_gpu(_load_asr)
     get_vad()
     get_encoder()
     log.info(
@@ -650,7 +680,7 @@ async def model_unload():
         with _transcribe_lock:
             return manager.unload_now()
 
-    evicted = await loop.run_in_executor(None, do_unload)
+    evicted = await _run_on_gpu(do_unload)
     return {"unloaded": evicted, "manager": manager.status()}
 
 
@@ -697,8 +727,11 @@ async def transcribe(
             kwargs["language"] = language
         if context:
             kwargs["context"] = context
-        with _transcribe_lock:
-            result = get_session().transcribe(tmp.name, **kwargs)
+
+        def run_batch_transcribe():
+            with _transcribe_lock:
+                return get_session().transcribe(tmp.name, **kwargs)
+        result = await _run_on_gpu(run_batch_transcribe)
         _clear_mlx_cache()
 
         elapsed = time.monotonic() - t0
@@ -886,10 +919,9 @@ async def align(
         tmp.write(content)
         tmp.flush()
         tmp.close()
-        loop = asyncio.get_event_loop()
         t0 = time.monotonic()
-        result = await loop.run_in_executor(
-            None, align_local_path, Path(tmp.name), language, int(max_chunk_seconds)
+        result = await _run_on_gpu(
+            align_local_path, Path(tmp.name), language, int(max_chunk_seconds)
         )
         result["model"] = _ALIGN_MODEL_LABEL
         log.info("Aligned in %.2fs: %d segments, %d chars",
@@ -994,11 +1026,10 @@ async def align_manifest(payload: dict = Body(...)):
                                        f"path not found: {p}")
         items.append({**entry, "_path": p})
 
-    loop = asyncio.get_event_loop()
     t0 = time.monotonic()
     try:
-        result = await loop.run_in_executor(
-            None, _align_manifest, items, language, max_chunk_seconds
+        result = await _run_on_gpu(
+            _align_manifest, items, language, max_chunk_seconds
         )
     except Exception as e:
         log.exception("Manifest alignment failed")
@@ -1656,7 +1687,6 @@ async def _idle_evict_loop():
     eviction never races an in-flight transcription."""
     if IDLE_EVICT_SECONDS <= 0:
         return
-    loop = asyncio.get_event_loop()
 
     def sweep():
         with _transcribe_lock:
@@ -1665,7 +1695,7 @@ async def _idle_evict_loop():
     while True:
         await asyncio.sleep(10)
         try:
-            await loop.run_in_executor(None, sweep)
+            await _run_on_gpu(sweep)
         except Exception:
             log.exception("idle-evict sweep failed")
 
@@ -1731,7 +1761,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
             with _transcribe_lock:
                 return get_session().transcribe(tmp.name, **kwargs)
 
-        result = await loop.run_in_executor(None, run_transcribe)
+        result = await _run_on_gpu(run_transcribe)
         _clear_mlx_cache()
         return result.text
     except Exception as e:
