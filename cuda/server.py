@@ -49,7 +49,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
-from polycore import ModelManager as AsrModelManager, ManagedUnit, free_cuda, trim_ram  # noqa: E402
+from polycore import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 
@@ -306,21 +306,19 @@ def _load_diarize_model():
     return pipeline
 
 
-# Model manager. With COLOAD on (default) the 'asr' and 'align' units co-reside
-# so benchday's asr is never evicted by an unchain align; with COLOAD off they
-# never co-reside (loading one evicts the other). The 'diarize' unit (pyannote)
-# is normally NOT loaded — it loads lazily on the first /v1/diarize call and is
-# idle-evicted like the others. Either way idle-evict reclaims the GPU for a
-# co-resident polytts/renderer.
-manager = AsrModelManager(
-    {
-        "asr": ManagedUnit("asr", _load_asr_model, free_cuda),
-        "align": ManagedUnit("align", _load_align_model, free_cuda),
-        "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda),
-    },
-    IDLE_EVICT_SECONDS,
-    coload=COLOAD,
-)
+# polycore model units. asr is HARD_PIN — benchday needs it hot at all times; it
+# is never idle-evicted. align/diarize are demand-driven (load lazily, evict when
+# idle). The manager + residency policy (LocalCoordinator standalone, or livestack's
+# LivestackCoordinator) is wired by attach() once `app` exists, below.
+HOST_ID = _env("HOST_ID", "zz-tower0")
+_UNITS = {
+    "asr": ManagedUnit("asr", _load_asr_model, free_cuda,
+                       residency_policy=ResidencyPolicy.HARD_PIN),
+    "align": ManagedUnit("align", _load_align_model, free_cuda),
+    "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda),
+}
+manager = None      # polycore.ModelManager, set by attach() / fallback below
+residence = None    # LivestackCoordinator (None in standalone mode)
 
 
 def get_session():
@@ -636,6 +634,25 @@ def _flatten_result_language(result) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (CUDA)", version="2.0.0")
+
+
+def _gpu_call(fn):
+    """Run a thunk under the GPU lock (warm/evict from the /livestack facade)."""
+    with _transcribe_lock:
+        return fn()
+
+
+# Wire the polycore manager + residency. With livestack present this becomes a
+# livestack node (lease-driven residence, exposed under /livestack); without it,
+# polycore's LocalCoordinator reproduces the standalone COLOAD + idle-evict.
+try:
+    from livestack_node import attach
+    manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
+                                idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
+                                gpu_call=_gpu_call)
+except ImportError:
+    from polycore import ModelManager
+    manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
 
 
 async def _idle_evict_loop():
