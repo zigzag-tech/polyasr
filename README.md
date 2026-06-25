@@ -1,34 +1,47 @@
-# polyasr
+<p align="center">
+  <img src="assets/header.png" alt="polyasr — speech to text" width="100%">
+</p>
 
-Generalized, multi-backend speech-recognition service in Zigzag's `poly*`
-family (alongside [polytts](https://github.com/zigzag-tech/polytts)). Built
-around [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) and the
-[Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B).
+<h1 align="center">polyasr</h1>
 
-polyasr owns both production backends, which share ONE HTTP/WS contract so
-clients are interchangeable:
+<p align="center">
+  <b>A self-hosted speech-to-text server.</b><br>
+  Turn spoken audio into accurate, time-stamped text — live as someone talks, or in batch from a file.
+</p>
 
-- **Apple Silicon / MLX** (`server.py`, `mlx-qwen3-asr`) — port `8765`.
-- **NVIDIA CUDA** (`cuda/server.py`, `qwen-asr`) — port `8766`.
+---
 
-It provides three capabilities over that contract:
+**polyasr** wraps Alibaba's [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+speech-recognition model and the
+[Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B)
+behind one small HTTP + WebSocket API. Point a microphone or an audio file at
+it and get text back. The **same API runs on two backends** — Apple Silicon
+(MLX) and NVIDIA (CUDA) — so your client doesn't change when you move from a Mac
+to a GPU box. It's the speech-to-text half of the `poly*` family, alongside its
+sibling [polytts](https://github.com/zigzag-tech/polytts) (text-to-speech).
 
-1. **Streaming dictation** — `WS /ws/transcribe` (benchday's protocol: BASR
-   framing, start/resume/stop, ackSeq, partial/final/done).
-2. **Batch transcription** — `POST /v1/audio/transcriptions` (OpenAI-compatible).
-3. **Forced alignment** — `POST /v1/align` (multipart upload) and
-   `POST /v1/align/manifest` (co-located local clips at absolute offsets,
-   stitched into one result), returning word/character-level timestamps.
-   Ported from unchain's Qwen3 aligner scripts.
+### What you can do with it
 
-By default polyasr **co-loads** its model units (`POLYASR_COLOAD=1`): the `asr`
-(streaming/batch) and `align` (forced-alignment) units may be resident at the
-same time, so benchday's `asr` is never evicted when unchain loads `align`.
-Set `POLYASR_COLOAD=0` for the historical **one-model-resident** behaviour
-(loading one unit evicts the other). Either way the resident unit(s) are
-**idle-evicted** after `POLYASR_IDLE_EVICT_SECONDS` so a co-resident workload
-(polytts, a renderer) can reclaim the GPU, and `POST /model/unload` force-frees
-all resident units immediately for an explicit hand-off.
+- 🎙️ **Live dictation** — stream microphone audio and get partial results as you
+  speak, final text when you pause. (`WS /ws/transcribe`)
+- 📝 **Batch transcription** — upload an audio file, get the transcript back.
+  OpenAI-compatible, so existing Whisper-style clients work unchanged.
+  (`POST /v1/audio/transcriptions`)
+- ⏱️ **Forced alignment** — line up an existing transcript with the audio to get
+  per-word / per-character timestamps — exactly what you need for subtitles or
+  karaoke-style highlighting. (`POST /v1/align`)
+
+### Why it exists
+
+- **One API, two GPUs.** An identical contract on Apple MLX (port `8765`) and
+  NVIDIA CUDA (port `8766`) — backends are drop-in interchangeable.
+- **Shares the GPU politely.** Models load lazily and are **idle-evicted** from
+  VRAM after a configurable timeout, so polyasr co-exists with other GPU
+  workloads (such as [polytts](https://github.com/zigzag-tech/polytts)) on a
+  single card. `POST /model/unload` hands the GPU back on demand.
+- **Tuned for real-world audio.** Built-in voice-activity detection (Silero VAD)
+  and main-speaker filtering (Resemblyzer) keep silence and background voices
+  out of the transcript.
 
 ## Layout
 
