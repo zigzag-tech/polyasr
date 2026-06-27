@@ -312,10 +312,12 @@ def _load_diarize_model():
 # LivestackCoordinator) is wired by attach() once `app` exists, below.
 HOST_ID = _env("HOST_ID", "zz-tower0")
 _UNITS = {
-    "asr": ManagedUnit("asr", _load_asr_model, free_cuda,
+    # footprint = VRAM bytes (weights + peak activation). Initial estimates from the
+    # 2026-06-27 align OOM + /health; refine with livestack_node.measure_footprint().
+    "asr": ManagedUnit("asr", _load_asr_model, free_cuda, footprint=5_000_000_000,
                        residency_policy=ResidencyPolicy.HARD_PIN),
-    "align": ManagedUnit("align", _load_align_model, free_cuda),
-    "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda),
+    "align": ManagedUnit("align", _load_align_model, free_cuda, footprint=3_000_000_000),
+    "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda, footprint=2_500_000_000),
 }
 manager = None      # polycore.ModelManager, set by attach() / fallback below
 residence = None    # LivestackCoordinator (None in standalone mode)
