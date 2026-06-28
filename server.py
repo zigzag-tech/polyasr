@@ -42,7 +42,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 _REPO_ROOT = str(Path(__file__).resolve().parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
-from polycore import ModelManager as AsrModelManager, ManagedUnit, free_mlx, trim_ram  # noqa: E402
+from polycore import (ModelManager as AsrModelManager, ManagedUnit, ResidencyPolicy,  # noqa: E402
+                      free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 
@@ -81,6 +82,8 @@ IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
 # benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
 # historical one-model-resident eviction behaviour.
 COLOAD = _envflag("COLOAD", "1")
+# Livestack node identity: this host's id in the residence broker/planner.
+HOST_ID = _env("HOST_ID", "xc-mac-studio")
 _vad_model = None
 _voice_encoder = None
 _transcribe_lock = threading.Lock()
@@ -319,15 +322,19 @@ def _load_diarize_model():
 # normally NOT loaded — it loads lazily on the first /v1/diarize call and is
 # idle-evicted like the others. Either way idle-evict reclaims memory for a
 # co-resident polytts/renderer.
-manager = AsrModelManager(
-    {
-        "asr": ManagedUnit("asr", _load_asr_model, free_mlx),
-        "align": ManagedUnit("align", _load_align_models, free_mlx),
-        "diarize": ManagedUnit("diarize", _load_diarize_model, free_mlx),
-    },
-    IDLE_EVICT_SECONDS,
-    coload=COLOAD,
-)
+# footprint = Metal bytes (weights + peak activation), mirrors the CUDA node's
+# estimates; refine with livestack_node.measure_footprint(). 'asr' is HARD_PIN so
+# the broker never evicts the primary dictation model for a co-resident TTS.
+_UNITS = {
+    "asr": ManagedUnit("asr", _load_asr_model, free_mlx, footprint=5_000_000_000,
+                       residency_policy=ResidencyPolicy.HARD_PIN),
+    "align": ManagedUnit("align", _load_align_models, free_mlx, footprint=3_000_000_000),
+    "diarize": ManagedUnit("diarize", _load_diarize_model, free_mlx, footprint=2_500_000_000),
+}
+# The manager + residency policy (LocalCoordinator standalone, or livestack's
+# LivestackCoordinator) is wired by attach() once `app` exists, below.
+manager = None      # polycore.ModelManager, set by attach() / fallback below
+residence = None    # LivestackCoordinator (None in standalone mode)
 
 
 def get_session():
@@ -619,6 +626,28 @@ async def finish_native_stream(state) -> str:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (MLX)", version="2.0.0")
+
+
+def _gpu_call(fn):
+    """Run a thunk on the single MLX GPU executor thread (facade warm/evict),
+    the same thread all transcribe/load/unload calls use — MLX's Metal stream
+    is thread-local, so residence mutations must run here too."""
+    return _gpu_executor.submit(fn).result()
+
+
+# Become a livestack node: lease-driven residence exposed under /livestack, so a
+# host-broker can arbitrate Metal VRAM across this ASR server and co-resident
+# TTS/renderer. Without livestack_node, polycore's LocalCoordinator reproduces the
+# standalone COLOAD + idle-evict behaviour unchanged.
+try:
+    from livestack_node import attach
+    manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
+                                idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
+                                gpu_call=_gpu_call)
+    log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
+except ImportError:
+    manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
+    log.info("livestack_node absent; standalone LocalCoordinator")
 
 
 @app.on_event("startup")
