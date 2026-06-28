@@ -145,51 +145,82 @@ def group_chars_into_sentences(
     """Group character-level timings into sentence-level segments.
 
     Qwen3-ForcedAligner emits one entry per character (no entry for
-    punctuation). We walk full_text in order, attach char timings as we
-    encounter matching characters, and emit a new sentence at every
+    punctuation). We walk full_text in order and attach char timings as we
+    encounter matching characters, emitting a new sentence at every
     sentence-end punctuation.
 
+    Robust to timing/text desync: if the current char does not match the
+    current timing entry, we scan a bounded window ahead in char_timings to
+    resync (skipping stray/extra timings) instead of stalling. A char with no
+    matching timing still keeps its TEXT — only its per-char time is left to
+    interpolation — so no transcript text is dropped. Segments missing explicit
+    timings inherit the surrounding segment bounds.
+
     Returns segments shaped like Whisper's: each has start/end/text and a
-    `words` array (one per character) with start/end/text.
+    `words` array with start/end/text.
     """
+    RESYNC_WINDOW = 8  # how far ahead to look for the matching timing
     segments: list[dict] = []
     cur_words: list[dict] = []
     cur_text = ""
     cur_start: float | None = None
     cur_end: float | None = None
+    last_end: float = 0.0  # carry timeline forward for untimed segments
 
     timing_idx = 0
+    n = len(char_timings)
+
+    def flush():
+        nonlocal cur_words, cur_text, cur_start, cur_end
+        if cur_text.strip():
+            st = cur_start if cur_start is not None else last_end
+            en = cur_end if cur_end is not None else st
+            segments.append({
+                "text": cur_text,
+                "start": st,
+                "end": en,
+                "words": cur_words,
+            })
+        cur_words = []
+        cur_text = ""
+        cur_start = None
+        cur_end = None
+
     for ch in full_text:
         cur_text += ch
         if ch in _SENTENCE_END_CHARS:
-            if cur_words:
-                segments.append({
-                    "text": cur_text,
-                    "start": cur_start if cur_start is not None else 0.0,
-                    "end": cur_end if cur_end is not None else (cur_start or 0.0),
-                    "words": cur_words,
-                })
-            cur_words = []
-            cur_text = ""
-            cur_start = None
-            cur_end = None
+            flush()
             continue
 
-        if timing_idx < len(char_timings):
+        # Try to match this char to a timing, resyncing if drifted.
+        if timing_idx < n:
             t = char_timings[timing_idx]
-            t_text = t.get("text", "")
-            if t_text == ch:
+            if t.get("text", "") == ch:
+                match_at = timing_idx
+            else:
+                # scan ahead for the same char to recover from desync
+                match_at = -1
+                hi = min(n, timing_idx + RESYNC_WINDOW)
+                for j in range(timing_idx, hi):
+                    if char_timings[j].get("text", "") == ch:
+                        match_at = j
+                        break
+            if match_at >= 0:
+                t = char_timings[match_at]
                 if cur_start is None:
                     cur_start = t["start"]
                 cur_end = t["end"]
+                last_end = t["end"]
                 cur_words.append({"text": ch, "start": t["start"], "end": t["end"]})
-                timing_idx += 1
+                timing_idx = match_at + 1
+            else:
+                # no timing for this char (extra text / punctuation drift):
+                # keep the text, leave timing to interpolation
+                cur_words.append({"text": ch, "start": cur_end if cur_end is not None else last_end,
+                                  "end": cur_end if cur_end is not None else last_end})
+        else:
+            cur_words.append({"text": ch, "start": last_end, "end": last_end})
 
-    if cur_words:
-        segments.append({
-            "text": cur_text,
-            "start": cur_start if cur_start is not None else 0.0,
-            "end": cur_end if cur_end is not None else (cur_start or 0.0),
-            "words": cur_words,
-        })
+    flush()
     return segments
+
