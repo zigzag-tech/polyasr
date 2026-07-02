@@ -142,6 +142,23 @@ ASR_STREAM_CHUNK_SEC = float(_env("STREAM_CHUNK_SEC", "2.0"))
 ASR_STREAM_MAX_CONTEXT_SEC = float(_env("STREAM_MAX_CONTEXT_SEC", "30.0"))
 ASR_STREAM_FINALIZATION_MODE = _env("STREAM_FINALIZATION_MODE", "latency")
 
+# Streaming-quality self-heal. The persistent MLX Session's short-window decode
+# path silently rots over long uptime (days): it returns EMPTY text for real
+# speech on the streaming/partial path while the full-buffer (batch/final) path
+# and /health stay green — so Harmony's residency+liveness health never trips,
+# and dictation dies with the model still "healthy". The keepwarm loop already
+# runs an idle-gated inference through the SAME _transcribe_buffer the partials
+# use; we upgrade it to transcribe a canonical speech clip and assert non-empty
+# output. Consecutive blanks => reload the asr unit through the (Harmony-wired)
+# manager; if a reload doesn't clear it, exit for launchd to restart the process.
+ASR_STREAMING_PROBE = _envflag("STREAMING_PROBE", "1")
+# Consecutive blank probes before reloading the asr unit in place.
+ASR_PROBE_FAIL_RELOAD = int(_env("PROBE_FAIL_RELOAD", "3"))
+# Consecutive blank probes (i.e. a reload didn't help) before exiting the
+# process so launchd/keepalive restarts it. 0 disables the exit escalation.
+ASR_PROBE_FAIL_EXIT = int(_env("PROBE_FAIL_EXIT", "6"))
+_PROBE_WAV_PATH = Path(__file__).parent / "assets" / "probe_speech_16k.wav"
+
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
 # (VAD tuning, speaker-embedding diagnostics, ASR regression tests). Disabled
@@ -695,6 +712,17 @@ async def health():
             "cache": round(mx.get_cache_memory() / 1024 / 1024),
         },
         "manager": manager.status(),
+        # Streaming-quality self-heal state. `healthy` is False once the partial
+        # path has silently rotted (empty transcript for canonical speech) — a
+        # failure /health's other fields and manager.status() cannot see.
+        "streaming_probe": {
+            "enabled": _probe_state["enabled"],
+            "healthy": _probe_state["consecutive_failures"] < ASR_PROBE_FAIL_RELOAD,
+            "ok": _probe_state["ok"],
+            "consecutive_failures": _probe_state["consecutive_failures"],
+            "reloads": _probe_state["reloads"],
+            "last_text": _probe_state["last_text"],
+        },
     }
 
 
@@ -1729,6 +1757,94 @@ async def _idle_evict_loop():
             log.exception("idle-evict sweep failed")
 
 
+# Streaming-quality probe state, surfaced in /health and driven by the keepwarm
+# loop. `_PROBE_PCM` is the canonical speech clip's raw 16k mono PCM (None if the
+# asset is missing → probe disabled).
+_PROBE_PCM: Optional[bytes] = None
+_probe_state = {
+    "enabled": False,
+    "ok": None,            # last probe result: True/False/None(not yet run)
+    "consecutive_failures": 0,
+    "reloads": 0,
+    "last_ok_monotonic": 0.0,
+    "last_text": "",
+}
+
+
+def _load_probe_pcm() -> Optional[bytes]:
+    """Load the canonical probe clip's PCM once. Returns None if unavailable."""
+    if not ASR_STREAMING_PROBE:
+        return None
+    try:
+        with wave.open(str(_PROBE_WAV_PATH), "rb") as w:
+            if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (SAMPLE_RATE, 1, 2):
+                log.warning("streaming probe clip %s is not 16k mono s16; disabling probe",
+                            _PROBE_WAV_PATH)
+                return None
+            return w.readframes(w.getnframes())
+    except FileNotFoundError:
+        log.warning("streaming probe clip %s missing; streaming-quality self-heal disabled",
+                    _PROBE_WAV_PATH)
+        return None
+    except Exception:
+        log.exception("failed to load streaming probe clip; probe disabled")
+        return None
+
+
+async def _reload_asr_unit() -> None:
+    """Force-evict and reload the asr MLX Session in place, through the same
+    (Harmony-wired) manager the broker coordinates — a cooperative unit reload,
+    not an external process kill. Clears the persistent Session's rotted decode
+    state. Runs on the GPU worker thread (Metal stream is thread-local)."""
+    def do_reload():
+        with _transcribe_lock:
+            try:
+                manager.unload_now()
+            finally:
+                get_session()  # reload a fresh Session
+    await _run_on_gpu(do_reload)
+
+
+async def _run_streaming_probe() -> None:
+    """Transcribe the canonical speech clip through the streaming/partial path
+    (_transcribe_buffer) and assert non-empty output. On ASR_PROBE_FAIL_RELOAD
+    consecutive blanks, reload the unit; on ASR_PROBE_FAIL_EXIT, exit for
+    launchd to restart. Idle-gating + residency are handled by the caller."""
+    idle_before = manager.last_used
+    try:
+        text = (await _transcribe_buffer(bytearray(_PROBE_PCM))).strip()
+    except Exception:
+        log.exception("streaming probe transcription raised")
+        text = ""
+    finally:
+        if IDLE_EVICT_SECONDS > 0:
+            manager.last_used = idle_before  # the probe must not count as use
+
+    if text:
+        _probe_state.update(ok=True, consecutive_failures=0,
+                            last_ok_monotonic=time.monotonic(), last_text=text[:80])
+        return
+
+    _probe_state["consecutive_failures"] += 1
+    _probe_state["ok"] = False
+    n = _probe_state["consecutive_failures"]
+    log.error("streaming probe returned EMPTY for canonical speech (%d consecutive); "
+              "batch/full-buffer likely still work — this is the silent partial-window rot", n)
+
+    if ASR_PROBE_FAIL_EXIT > 0 and n >= ASR_PROBE_FAIL_EXIT:
+        log.critical("streaming probe still blank after reload (%d consecutive); exiting for "
+                     "launchd restart", n)
+        os._exit(1)
+
+    if n == ASR_PROBE_FAIL_RELOAD:
+        log.error("reloading asr unit to clear rotted streaming decode state")
+        try:
+            await _reload_asr_unit()
+            _probe_state["reloads"] += 1
+        except Exception:
+            log.exception("asr unit reload failed")
+
+
 async def _keepwarm_loop():
     """Run a tiny inference during idle gaps so the model/Metal kernels stay
     hot and the first real partial after a lull isn't ~9s (which would miss the
@@ -1742,6 +1858,9 @@ async def _keepwarm_loop():
     count as use. With idle-evict disabled it behaves as before."""
     if ASR_KEEPWARM_INTERVAL_SEC <= 0:
         return
+    global _PROBE_PCM
+    _PROBE_PCM = _load_probe_pcm()
+    _probe_state["enabled"] = _PROBE_PCM is not None
     silence = bytes(int(BYTES_PER_SEC * 0.3))
     while True:
         await asyncio.sleep(ASR_KEEPWARM_INTERVAL_SEC)
@@ -1752,11 +1871,20 @@ async def _keepwarm_loop():
             continue
         try:
             t0 = time.monotonic()
-            idle_before = manager.last_used
-            await _transcribe_buffer(bytearray(silence))
-            if IDLE_EVICT_SECONDS > 0:
-                manager.last_used = idle_before  # don't let warmup reset idle-evict
-            log.info("keepwarm tick (%.2fs)", time.monotonic() - t0)
+            if _PROBE_PCM is not None:
+                # The probe transcribes real speech through the partial path, so
+                # it both warms the model AND verifies streaming correctness (and
+                # restores the idle timer itself).
+                await _run_streaming_probe()
+                log.info("keepwarm+probe tick (%.2fs, ok=%s, fails=%d)",
+                         time.monotonic() - t0, _probe_state["ok"],
+                         _probe_state["consecutive_failures"])
+            else:
+                idle_before = manager.last_used
+                await _transcribe_buffer(bytearray(silence))
+                if IDLE_EVICT_SECONDS > 0:
+                    manager.last_used = idle_before  # don't let warmup reset idle-evict
+                log.info("keepwarm tick (%.2fs)", time.monotonic() - t0)
         except Exception:
             log.exception("keepwarm transcription failed")
 
