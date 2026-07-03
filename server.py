@@ -159,6 +159,22 @@ ASR_PROBE_FAIL_RELOAD = int(_env("PROBE_FAIL_RELOAD", "3"))
 ASR_PROBE_FAIL_EXIT = int(_env("PROBE_FAIL_EXIT", "6"))
 _PROBE_WAV_PATH = Path(__file__).parent / "assets" / "probe_speech_16k.wav"
 
+# Live rot detection from real dictation traffic (complements the idle probe:
+# catches the rot on the next real session instead of waiting ~2min of idle
+# probing). The safe signature is the SAME divergence we diagnosed, not "a
+# partial was empty" (which is legitimately empty for noise/onsets/low-confidence
+# audio): a session that carried sustained speech signal AND whose FINAL
+# succeeded (proving there was transcribable speech) yet emitted ZERO non-empty
+# partials. `LIVE_RELOAD_WITNESSES` consecutive such sessions (any healthy
+# partial resets the count) flags a reload, executed by the idle-gated keepwarm
+# loop — never mid-stream.
+ASR_LIVE_ROT_DETECT = _envflag("LIVE_ROT_DETECT", "1")
+# Min seconds of signal-bearing audio for a blank-partials session to count as a
+# rot witness (below this, blank partials are inconclusive, not evidence).
+ASR_LIVE_MIN_SPEECH_SEC = float(_env("LIVE_MIN_SPEECH_SEC", "2.0"))
+# Consecutive rot-witness sessions before requesting a reload (hysteresis).
+ASR_LIVE_RELOAD_WITNESSES = int(_env("LIVE_RELOAD_WITNESSES", "2"))
+
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
 # (VAD tuning, speaker-embedding diagnostics, ASR regression tests). Disabled
@@ -722,6 +738,13 @@ async def health():
             "consecutive_failures": _probe_state["consecutive_failures"],
             "reloads": _probe_state["reloads"],
             "last_text": _probe_state["last_text"],
+            # Live rot detection from real dictation traffic.
+            "live": {
+                "enabled": ASR_LIVE_ROT_DETECT,
+                "witnesses": _live_state["witnesses"],
+                "reload_requested": _live_state["reload_requested"],
+                "reloads": _live_state["reloads"],
+            },
         },
     }
 
@@ -1217,6 +1240,7 @@ async def ws_transcribe(ws: WebSocket):
     last_partial_text = ""
     raw_signal_bytes = 0
     raw_signal_bytes_at_last_partial = 0
+    partials_emitted = 0   # count of non-empty partials sent this session
     native_stream_state = None
     partial_task = None
     closing = False
@@ -1281,7 +1305,7 @@ async def ws_transcribe(ws: WebSocket):
         })
 
     async def emit_partial(text: str, audio_sec: Optional[float] = None) -> None:
-        nonlocal last_partial_text
+        nonlocal last_partial_text, partials_emitted
         if closing or not text or text == last_partial_text:
             return
         delta = None
@@ -1296,6 +1320,7 @@ async def ws_transcribe(ws: WebSocket):
             payload["delta"] = delta
         await send_json(payload)
         last_partial_text = text
+        partials_emitted += 1
         sync_protocol_session()
         log.info("Partial: %s", text[:80])
         ev = {"text": text}
@@ -1736,6 +1761,16 @@ async def ws_transcribe(ws: WebSocket):
             await loop.run_in_executor(None, slog.close)
         except Exception:
             log.exception("Session logger close failed")
+        # Live rot detection: classify this ended session (never mid-stream).
+        try:
+            _note_session_outcome(
+                signal_bytes=raw_signal_bytes,
+                final_text=(protocol_session.final_text
+                            if protocol_session is not None else ""),
+                partials_emitted=partials_emitted,
+            )
+        except Exception:
+            log.exception("live rot outcome eval failed")
 
 
 async def _idle_evict_loop():
@@ -1769,6 +1804,43 @@ _probe_state = {
     "last_ok_monotonic": 0.0,
     "last_text": "",
 }
+
+# Live rot detection accumulator, updated at each session's end and acted on by
+# the idle-gated keepwarm loop. `reload_requested` decouples DETECTION (from real
+# traffic, immediate) from ACTION (reload only during an idle gap, never
+# mid-stream).
+_live_state = {
+    "witnesses": 0,           # consecutive rot-witness sessions
+    "reload_requested": False,
+    "reloads": 0,
+}
+
+
+def _note_session_outcome(signal_bytes: int, final_text: str, partials_emitted: int) -> None:
+    """Classify a just-ended dictation session for the live rot signature.
+
+    - HEALTHY  (>=1 non-empty partial): partials work -> reset the witness count.
+    - WITNESS  (enough speech signal + non-empty final + zero non-empty
+      partials): the exact partial-window rot -> increment; at
+      LIVE_RELOAD_WITNESSES, request a reload (the keepwarm loop performs it).
+    - INCONCLUSIVE (short/quiet/no-final, e.g. noise-only or a client that bailed
+      before stop): leave the count unchanged.
+    """
+    if not ASR_LIVE_ROT_DETECT:
+        return
+    if partials_emitted > 0:
+        _live_state["witnesses"] = 0
+        return
+    speech_sec = signal_bytes / BYTES_PER_SEC
+    if speech_sec < ASR_LIVE_MIN_SPEECH_SEC or not (final_text or "").strip():
+        return  # inconclusive — not evidence either way
+    _live_state["witnesses"] += 1
+    n = _live_state["witnesses"]
+    log.error("live rot witness: %.1fs speech, non-empty final, ZERO partials "
+              "(%d consecutive) — silent partial-window rot", speech_sec, n)
+    if n >= ASR_LIVE_RELOAD_WITNESSES:
+        _live_state["reload_requested"] = True
+        log.error("requesting asr reload at next idle gap (live rot witnesses=%d)", n)
 
 
 def _load_probe_pcm() -> Optional[bytes]:
@@ -1871,6 +1943,18 @@ async def _keepwarm_loop():
             continue
         try:
             t0 = time.monotonic()
+            # Live rot detector flagged a reload from real traffic; this tick is
+            # an idle gap (not skipped, model resident) so it's safe to act now.
+            if _live_state["reload_requested"]:
+                log.error("live rot: reloading asr unit at idle gap (witnesses=%d)",
+                          _live_state["witnesses"])
+                idle_before = manager.last_used
+                await _reload_asr_unit()
+                if IDLE_EVICT_SECONDS > 0:
+                    manager.last_used = idle_before
+                _live_state["reload_requested"] = False
+                _live_state["witnesses"] = 0
+                _live_state["reloads"] += 1
             if _PROBE_PCM is not None:
                 # The probe transcribes real speech through the partial path, so
                 # it both warms the model AND verifies streaming correctness (and
