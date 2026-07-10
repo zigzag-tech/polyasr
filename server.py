@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 _REPO_ROOT = str(Path(__file__).resolve().parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
-from polycore import (ModelManager as AsrModelManager, ManagedUnit, ResidencyPolicy,  # noqa: E402
+from livestack_node import (ModelManager as AsrModelManager, ManagedUnit, ResidencyPolicy,  # noqa: E402
                       free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
