@@ -96,23 +96,37 @@ def load_audio_chunks(path: Path, chunk_seconds: int):
     _log(f"Audio duration {duration:.1f}s > chunk size {chunk_seconds}s — splitting")
 
     chunk_idx = 0
-    with wave.open(str(wav_path), "rb") as wf:
-        per_chunk = chunk_seconds * sample_rate
-        offset_seconds = 0.0
-        while True:
-            frames = wf.readframes(per_chunk)
-            if not frames:
-                break
-            tmpdir = tempfile.mkdtemp(prefix="polyasr_chunk_")
-            chunk_path = Path(tmpdir) / f"chunk_{chunk_idx:03d}.wav"
-            with wave.open(str(chunk_path), "wb") as out:
-                out.setnchannels(n_channels)
-                out.setsampwidth(sample_width)
-                out.setframerate(sample_rate)
-                out.writeframes(frames)
-            yield chunk_idx, offset_seconds, chunk_path
-            offset_seconds += chunk_seconds
-            chunk_idx += 1
+    prev_tmpdir = None
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            per_chunk = chunk_seconds * sample_rate
+            offset_seconds = 0.0
+            while True:
+                frames = wf.readframes(per_chunk)
+                if not frames:
+                    break
+                # The consumer is done with the previously-yielded chunk once it
+                # resumes us; delete it so a long file does not pile chunk dirs up in
+                # /tmp. ~390 leaked chunk dirs filling the tmpfs was the original align
+                # OOM. The last chunk (and any in flight on early-break/exception via
+                # GeneratorExit) is cleaned in the finally below.
+                if prev_tmpdir is not None:
+                    shutil.rmtree(prev_tmpdir, ignore_errors=True)
+                    prev_tmpdir = None
+                tmpdir = tempfile.mkdtemp(prefix="polyasr_chunk_")
+                prev_tmpdir = tmpdir
+                chunk_path = Path(tmpdir) / f"chunk_{chunk_idx:03d}.wav"
+                with wave.open(str(chunk_path), "wb") as out:
+                    out.setnchannels(n_channels)
+                    out.setsampwidth(sample_width)
+                    out.setframerate(sample_rate)
+                    out.writeframes(frames)
+                yield chunk_idx, offset_seconds, chunk_path
+                offset_seconds += chunk_seconds
+                chunk_idx += 1
+    finally:
+        if prev_tmpdir is not None:
+            shutil.rmtree(prev_tmpdir, ignore_errors=True)
 
 
 _BCP47_TO_QWEN_LANG = {
