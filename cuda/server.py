@@ -49,7 +49,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
-from polycore import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
+from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 
@@ -653,7 +653,7 @@ try:
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call)
 except ImportError:
-    from polycore import ModelManager
+    from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
 
 
@@ -798,8 +798,7 @@ def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int
     detected_language: Optional[str] = None
     norm = polyasr_align.normalize_language(language)
 
-    with _transcribe_lock:
-        model = manager.ensure("align")
+    with _transcribe_lock, manager.run_scope("align") as model:
         for chunk_idx, offset, chunk_path in polyasr_align.load_audio_chunks(
             audio_path, max_chunk_seconds
         ):
@@ -946,8 +945,7 @@ def diarize_local_path(
     """Diarize one local audio file. Returns {segments:[{start,end,speaker}],
     speakers, num_speakers}. Holds _transcribe_lock so the pipeline load + run
     are serialized with the other managed units, exactly like align."""
-    with _transcribe_lock:
-        pipeline = manager.ensure("diarize")
+    with _transcribe_lock, manager.run_scope("diarize") as pipeline:
         return polyasr_diarize.diarize(
             pipeline, path, num_speakers, min_speakers, max_speakers
         )
