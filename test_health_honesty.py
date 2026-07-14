@@ -92,6 +92,13 @@ class ComputeHealth(unittest.TestCase):
     def test_staleness_disabled_when_probe_unscheduled(self):
         self.assertEqual(health(stale_after_sec=None, last_ok_age_sec=None), ("ok", []))
 
+    def test_busy_server_is_not_stale(self):
+        # FALSE-ALARM GUARD: the probe only runs in idle gaps, so a server under
+        # continuous dictation never probes. Successful real traffic counts as
+        # freshness (the caller passes the age of the most recent GOOD output,
+        # probe or real transcription) — a busy healthy server must not page.
+        self.assertEqual(health(last_ok_age_sec=5.0), ("ok", []))
+
 
 if __name__ == "__main__":
     unittest.main()

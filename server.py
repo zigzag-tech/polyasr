@@ -114,6 +114,10 @@ async def _run_on_gpu(fn, *args, **kwargs):
 # Monotonic timestamp of the most recent transcription, used by the keep-warm
 # loop to skip warmups when real traffic is already keeping the model hot.
 _last_transcribe_monotonic = 0.0
+# Last transcribe that produced NON-EMPTY text. Real successful traffic is
+# freshness evidence in its own right: the probe only runs in idle gaps, so
+# continuous (healthy) dictation would otherwise starve it and read as stale.
+_last_good_transcribe_monotonic = 0.0
 
 # MLX allocates Metal buffers aggressively and never returns them to the OS.
 # Cap decoder length (ASR utterances rarely need >256 tokens) and clear the
@@ -808,11 +812,14 @@ async def startup_event():
 @app.get("/health")
 async def health():
     weights_present = _weights_state["present"]
-    last_ok_age = (
-        None
-        if not _probe_state["last_ok_monotonic"]
-        else time.monotonic() - _probe_state["last_ok_monotonic"]
+    # Freshness = the most recent proof the streaming path produced real text:
+    # a successful probe OR a successful real transcription. The probe only runs
+    # in idle gaps, so counting only probes would report a continuously-busy
+    # (and perfectly healthy) server as stale.
+    last_good = max(
+        _probe_state["last_ok_monotonic"], _last_good_transcribe_monotonic
     )
+    last_ok_age = None if not last_good else time.monotonic() - last_good
     # A probe is only expected to have run recently if the unit is servable at
     # all; when the model is legitimately evicted and the weights are fine, the
     # cheap weights check is the health signal (we don't resurrect it just to
@@ -2226,6 +2233,9 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
 
         result = await _run_on_gpu(run_transcribe)
         _clear_mlx_cache()
+        if (result.text or "").strip():
+            global _last_good_transcribe_monotonic
+            _last_good_transcribe_monotonic = time.monotonic()
         return result.text
     except ModelUnavailable:
         # The model could not be LOADED. This must never look like silence: an
