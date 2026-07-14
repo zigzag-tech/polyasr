@@ -175,6 +175,16 @@ ASR_LIVE_MIN_SPEECH_SEC = float(_env("LIVE_MIN_SPEECH_SEC", "2.0"))
 # Consecutive rot-witness sessions before requesting a reload (hysteresis).
 ASR_LIVE_RELOAD_WITNESSES = int(_env("LIVE_RELOAD_WITNESSES", "2"))
 
+# A probe result that is merely OLD must not read as healthy: on 2026-07-14 the
+# probe stopped running entirely (evicted model → keepwarm `continue`d) and
+# /health kept serving `ok: true` with a stale `last_text` straight through a
+# total outage. A successful probe must land within this window while the model
+# is servable, or health is degraded. Default = 4 keepwarm intervals.
+ASR_PROBE_STALE_AFTER_SEC = float(_env("PROBE_STALE_AFTER_SEC", "0")) or None
+# How often to verify the model is loadable at all (cheap, no GPU, does not
+# resurrect an evicted unit).
+ASR_WEIGHTS_CHECK_INTERVAL_SEC = float(_env("WEIGHTS_CHECK_INTERVAL_SEC", "60"))
+
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
 # (VAD tuning, speaker-embedding diagnostics, ASR regression tests). Disabled
@@ -315,6 +325,71 @@ def _decode_protocol_audio_frame(frame: bytes):
         return None
     seq = int.from_bytes(frame[8:16], "big", signed=False)
     return seq, frame[ASR_FRAME_HEADER_BYTES:]
+
+
+def compute_health(
+    *,
+    weights_present: bool,
+    probe_enabled: bool,
+    consecutive_failures: int,
+    fail_threshold: int,
+    last_ok_age_sec: Optional[float],
+    stale_after_sec: Optional[float],
+) -> tuple[str, list[str]]:
+    """Derive (status, reasons) — the honest health of the streaming path.
+
+    PURE: no I/O, no clock (the age is passed in), so the incident state is
+    directly testable. `/health.status` was previously the literal "ok", which
+    made the fleet's only paging signal a constant.
+
+    Degraded when:
+      - the weights cannot be loaded at all (a wiped HF cache; the model then
+        transcribes to EMPTY, which looks exactly like silence), or
+      - the streaming probe is failing (the silent partial-window rot), or
+      - no probe has SUCCEEDED within the staleness window. Absence of evidence
+        is not health: a probe that stopped running kept reporting green
+        (consecutive_failures == 0) through a total outage.
+    """
+    reasons: list[str] = []
+    if not weights_present:
+        reasons.append("weights_missing")
+    if probe_enabled:
+        if fail_threshold > 0 and consecutive_failures >= fail_threshold:
+            reasons.append("streaming_probe_failing")
+        if stale_after_sec and (last_ok_age_sec is None or last_ok_age_sec > stale_after_sec):
+            reasons.append("streaming_probe_stale")
+    return ("ok" if not reasons else "degraded", reasons)
+
+
+class ModelUnavailable(RuntimeError):
+    """The ASR model could not be loaded (weights missing, OOM, bad checkout).
+
+    Distinct from an inference error on a loaded model: an unloadable model must
+    surface as a hard failure, never as an empty transcript. See
+    docs/health-honesty.md.
+    """
+
+
+def _asr_weights_present() -> bool:
+    """Can the ASR model be loaded from the local HF cache, right now?
+
+    Cheap: resolves the snapshot offline — no GPU, no inference, and it does NOT
+    resurrect an evicted unit (so it is safe to call on a timer while Harmony has
+    the model evicted). This is the check that catches a wiped/incomplete cache,
+    which is otherwise invisible until the next reload.
+    """
+    if os.path.isdir(MODEL_NAME):  # a local path, not an HF repo id
+        return True
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            MODEL_NAME,
+            allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"],
+            local_files_only=True,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _load_asr_model():
@@ -704,12 +779,25 @@ async def startup_event():
         ASR_NATIVE_STREAMING,
         ASR_FINAL_WAIT_PARTIAL,
     )
+    # Verify the weights are actually on disk before anything else: a wiped HF
+    # cache is invisible to a process that already holds the model in RAM, and
+    # only bites at the next (re)load — hours later, as an outage.
+    await _refresh_weights_state(force=True)
+
     # Warm the model now so the very first request after a (re)start is fast,
-    # then keep it warm during idle gaps.
+    # then keep it warm during idle gaps. Warm with the PROBE clip when we have
+    # one: it warms the same partial path AND establishes probe freshness, so a
+    # freshly-booted server isn't reported stale for its first keepwarm interval.
+    global _PROBE_PCM
+    _PROBE_PCM = _load_probe_pcm()
+    _probe_state["enabled"] = _PROBE_PCM is not None
     try:
-        await _transcribe_buffer(bytearray(int(BYTES_PER_SEC * 0.3)))
-        log.info("Startup warmup complete (keepwarm interval=%.0fs).",
-                 ASR_KEEPWARM_INTERVAL_SEC)
+        if _PROBE_PCM is not None:
+            await _run_streaming_probe()
+        else:
+            await _transcribe_buffer(bytearray(int(BYTES_PER_SEC * 0.3)))
+        log.info("Startup warmup complete (keepwarm interval=%.0fs, probe=%s).",
+                 ASR_KEEPWARM_INTERVAL_SEC, _probe_state["ok"])
     except Exception:
         log.exception("Startup warmup failed")
     asyncio.create_task(_keepwarm_loop())
@@ -719,8 +807,29 @@ async def startup_event():
 
 @app.get("/health")
 async def health():
+    weights_present = _weights_state["present"]
+    last_ok_age = (
+        None
+        if not _probe_state["last_ok_monotonic"]
+        else time.monotonic() - _probe_state["last_ok_monotonic"]
+    )
+    # A probe is only expected to have run recently if the unit is servable at
+    # all; when the model is legitimately evicted and the weights are fine, the
+    # cheap weights check is the health signal (we don't resurrect it just to
+    # probe). But an evicted model whose weights are GONE is degraded.
+    servable = "asr" in manager.resident
+    status, reasons = compute_health(
+        weights_present=weights_present,
+        probe_enabled=_probe_state["enabled"] and servable,
+        consecutive_failures=_probe_state["consecutive_failures"],
+        fail_threshold=ASR_PROBE_FAIL_RELOAD,
+        last_ok_age_sec=last_ok_age,
+        stale_after_sec=_probe_stale_after(),
+    )
     return {
-        "status": "ok",
+        "status": status,
+        "reasons": reasons,
+        "weights_present": weights_present,
         "model": MODEL_NAME,
         "memory_mb": {
             "active": round(mx.get_active_memory() / 1024 / 1024),
@@ -733,9 +842,14 @@ async def health():
         # failure /health's other fields and manager.status() cannot see.
         "streaming_probe": {
             "enabled": _probe_state["enabled"],
-            "healthy": _probe_state["consecutive_failures"] < ASR_PROBE_FAIL_RELOAD,
+            # NOT just "few failures": a probe that never ran, or last succeeded
+            # an hour ago, is not evidence of health (that exact reading kept
+            # /health green through the 2026-07-14 outage).
+            "healthy": "streaming_probe_failing" not in reasons
+            and "streaming_probe_stale" not in reasons,
             "ok": _probe_state["ok"],
             "consecutive_failures": _probe_state["consecutive_failures"],
+            "last_ok_age_sec": None if last_ok_age is None else round(last_ok_age, 1),
             "reloads": _probe_state["reloads"],
             "last_text": _probe_state["last_text"],
             # Live rot detection from real dictation traffic.
@@ -810,7 +924,11 @@ async def transcribe(
 
         def run_batch_transcribe():
             with _transcribe_lock:
-                return get_session().transcribe(tmp.name, **kwargs)
+                try:
+                    sess = get_session()
+                except Exception as e:
+                    raise ModelUnavailable(str(e)) from e
+                return sess.transcribe(tmp.name, **kwargs)
         result = await _run_on_gpu(run_batch_transcribe)
         _clear_mlx_cache()
 
@@ -830,6 +948,11 @@ async def transcribe(
             })
         else:
             return JSONResponse({"text": result.text})
+    except ModelUnavailable as e:
+        # 503, not 500: the node cannot serve at all (weights gone / unloadable),
+        # so callers should route to another node rather than retry here.
+        log.critical("ASR model unavailable (batch): %s", e)
+        raise HTTPException(status_code=503, detail=f"asr model unavailable: {e}")
     except Exception as e:
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1747,6 +1870,32 @@ async def ws_transcribe(ws: WebSocket):
                 if protocol_session is not None else None
             ),
         })
+    except ModelUnavailable as e:
+        # The model cannot be loaded (e.g. the weights were deleted underneath a
+        # long-running process). Fail the session LOUDLY instead of streaming
+        # empty transcripts: the benchday client fails over on WS disconnect, so
+        # closing here reroutes dictation to a healthy node. A silent empty
+        # transcript would just look like a dead microphone.
+        log.critical("ASR model unavailable; failing session so the client fails over: %s", e)
+        slog.event("model_unavailable", {"message": str(e)})
+        # Real traffic just proved the model can't load — re-check now rather than
+        # waiting for the next timer tick, so /health degrades immediately.
+        try:
+            await _refresh_weights_state(force=True)
+        except Exception:
+            log.exception("forced weights re-check failed")
+        try:
+            await send_json({
+                "type": "error",
+                "code": "model_unavailable",
+                "error": str(e),
+            })
+        except Exception:
+            pass
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
     except Exception as e:
         log.exception("WebSocket error: %s", e)
         slog.event("error", {"message": str(e)})
@@ -1814,6 +1963,42 @@ _live_state = {
     "reload_requested": False,
     "reloads": 0,
 }
+
+# Loadability of the model on disk, refreshed on a timer by the keepwarm loop.
+# Optimistic at boot; startup verifies it immediately.
+_weights_state = {"present": True, "checked_monotonic": 0.0}
+
+
+def _probe_stale_after() -> Optional[float]:
+    """How old a successful probe may be before health degrades."""
+    if ASR_PROBE_STALE_AFTER_SEC:
+        return ASR_PROBE_STALE_AFTER_SEC
+    if ASR_KEEPWARM_INTERVAL_SEC <= 0:
+        return None  # probe isn't scheduled at all; staleness is meaningless
+    return ASR_KEEPWARM_INTERVAL_SEC * 4
+
+
+async def _refresh_weights_state(force: bool = False) -> bool:
+    """Re-check (off-thread) whether the model is loadable from the local cache."""
+    now = time.monotonic()
+    if (
+        not force
+        and _weights_state["checked_monotonic"]
+        and now - _weights_state["checked_monotonic"] < ASR_WEIGHTS_CHECK_INTERVAL_SEC
+    ):
+        return _weights_state["present"]
+    present = await asyncio.get_event_loop().run_in_executor(None, _asr_weights_present)
+    was = _weights_state["present"]
+    _weights_state.update(present=present, checked_monotonic=now)
+    if was and not present:
+        log.critical(
+            "ASR weights for %s are GONE from the local cache — the model cannot be "
+            "(re)loaded. Transcription would return EMPTY text. /health is now degraded.",
+            MODEL_NAME,
+        )
+    elif present and not was:
+        log.warning("ASR weights for %s are back; health recovering", MODEL_NAME)
+    return present
 
 
 def _note_session_outcome(signal_bytes: int, final_text: str, partials_emitted: int) -> None:
@@ -1903,6 +2088,16 @@ async def _run_streaming_probe() -> None:
     log.error("streaming probe returned EMPTY for canonical speech (%d consecutive); "
               "batch/full-buffer likely still work — this is the silent partial-window rot", n)
 
+    if not _weights_state["present"]:
+        # The weights are gone from disk. Neither a unit reload nor a process
+        # restart can conjure them back, and exiting would just crash-loop under
+        # launchd. Stay up, stay LOUD (/health is degraded, sessions error out so
+        # clients fail over to a healthy node), and recover on their own when the
+        # cache is restored.
+        log.critical("streaming probe blank because the ASR weights are missing; "
+                     "not reloading/exiting (it cannot help) — /health is degraded")
+        return
+
     if ASR_PROBE_FAIL_EXIT > 0 and n >= ASR_PROBE_FAIL_EXIT:
         log.critical("streaming probe still blank after reload (%d consecutive); exiting for "
                      "launchd restart", n)
@@ -1930,16 +2125,39 @@ async def _keepwarm_loop():
     count as use. With idle-evict disabled it behaves as before."""
     if ASR_KEEPWARM_INTERVAL_SEC <= 0:
         return
-    global _PROBE_PCM
-    _PROBE_PCM = _load_probe_pcm()
-    _probe_state["enabled"] = _PROBE_PCM is not None
+    # _PROBE_PCM / probe_state["enabled"] are established at startup (which warms
+    # via the probe itself, so freshness holds from boot).
     silence = bytes(int(BYTES_PER_SEC * 0.3))
     while True:
         await asyncio.sleep(ASR_KEEPWARM_INTERVAL_SEC)
+
+        # --- Health work that must run REGARDLESS of traffic and residency ---
+        # The 2026-07-14 outage lived in exactly the two states the gates below
+        # skip: (a) recent traffic — which was *failing* traffic, the user
+        # retrying into a dead mic — and (b) an evicted model that could no
+        # longer load. Anything gated behind "warm and resident" is blind
+        # precisely when the server is broken.
+        try:
+            await _refresh_weights_state()
+        except Exception:
+            log.exception("weights check failed")
+
+        evicted = IDLE_EVICT_SECONDS > 0 and "asr" not in manager.resident
+        if evicted and _live_state["reload_requested"]:
+            # A pending reload must never be starved by eviction (it sat
+            # unexecuted forever: reload_requested=true, reloads=0). The unit is
+            # already unloaded, so the next load builds a fresh Session — the
+            # request is satisfied by definition.
+            log.warning("live rot: unit already evicted; pending reload satisfied by next load")
+            _live_state["reload_requested"] = False
+            _live_state["witnesses"] = 0
+            _live_state["reloads"] += 1
+
         if time.monotonic() - _last_transcribe_monotonic < ASR_KEEPWARM_INTERVAL_SEC:
             continue
-        if IDLE_EVICT_SECONDS > 0 and "asr" not in manager.resident:
-            # Model already evicted; don't resurrect it.
+        if evicted:
+            # Model already evicted; don't resurrect it (weights are verified
+            # above, which is the health signal while evicted).
             continue
         try:
             t0 = time.monotonic()
@@ -2000,12 +2218,25 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
             kwargs["context"] = context
         def run_transcribe():
             with _transcribe_lock:
-                return get_session().transcribe(tmp.name, **kwargs)
+                try:
+                    sess = get_session()
+                except Exception as e:  # weights gone, OOM, bad checkout, ...
+                    raise ModelUnavailable(str(e)) from e
+                return sess.transcribe(tmp.name, **kwargs)
 
         result = await _run_on_gpu(run_transcribe)
         _clear_mlx_cache()
         return result.text
-    except Exception as e:
+    except ModelUnavailable:
+        # The model could not be LOADED. This must never look like silence: an
+        # empty transcript is a lie the whole stack downstream inherits (partials
+        # drop empty text, the final ships "", the rot detector calls it
+        # inconclusive). Propagate so callers can fail the session loudly.
+        log.exception("ASR model unavailable")
+        raise
+    except Exception:
+        # Inference failed on a model that DID load — keep the historical
+        # empty-string behavior for this (unchanged blast radius).
         log.exception("Transcription error")
         return ""
     finally:
