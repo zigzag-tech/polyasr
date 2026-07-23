@@ -39,12 +39,43 @@ covered-finalization change exposed two problems, in order:
 - **`du -sh ~/.cache/huggingface` reports 0 B** because it is a symlink to
   `/opt/xc-data`. Check the target, not the link.
 
-## Next steps for whoever picks this up
+## Root cause: the model cache is on an EXTERNAL volume
 
-- Determine what the `open()` in MLX/Metal init is waiting on (Full Disk Access
-  for a launchd GUI agent reaching `/opt/xc-data`, or Metal shader cache).
-  Running the same command in a terminal — which has different TCC grants than
-  a launchd job — is the cheapest discriminator.
-- Until it is resolved, dictation uses zz-tower0. The client picks per session
-  and quarantines an unreachable endpoint, so a dead `:8765` degrades routing
-  rather than breaking dictation.
+`/opt/xc-data` — which `~/.cache/huggingface` symlinks into — is
+`Device Location: External` (PCIe). Since macOS 13, reading files on a
+removable/external volume needs the caller to hold the "Files and Folders →
+Removable Volumes" TCC grant. A background launchd **GUI agent** that lacks it
+causes the system to raise a consent prompt; with no interactive session to
+answer, the `open()` never returns. That is the wedge exactly: blocked in
+`__open`, no EPERM, no timeout, forever.
+
+The discriminator is decisive. Same binary, same env, same model:
+
+    launchctl (gui/501/io.zigzag.polyasr)  ->  wedged in open(), RSS flat ~105 MB
+    started from a shell                   ->  healthy, RSS 339 MB, /health ok
+
+A shell inherits the terminal/SSH session's Full Disk Access; the launchd agent
+has its own (absent) grant.
+
+**Why it "lasted" for months.** It never re-read the model. The process loaded
+weights once and served from RAM, so the missing grant — and later the missing
+files — cost nothing until something forced a reload. It was not robust; it was
+untested. The first restart in two months was the first test, and it failed.
+
+## Two things to fix
+
+1. **Get the weights off the external volume**, or grant the agent access to it.
+   Pointing `HF_HOME` at internal storage in the plist is the simplest, but the
+   internal container is 96.9% used (15.4 GB unallocated) and the ASR snapshot
+   is ~3.5 GB — workable, tight, and someone should decide that deliberately.
+   Granting TCC to a headless agent needs UI or an MDM profile, so it is not a
+   thing an agent can do over SSH.
+
+2. **Never let a model load hang without a deadline.** `open()` on a
+   consent-gated path blocks with no error, so a health check that only asks
+   "is the process alive?" reports green through it. The CUDA host already has
+   `cuda/runtime_preflight.py` for its stack; the MLX host needs the equivalent
+   for its weights path — verify the snapshot is readable, with a timeout,
+   BEFORE loading, and exit loudly if not. An invisible infinite hang is the
+   real defect here; the TCC grant is only its trigger.
+
