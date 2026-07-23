@@ -16,6 +16,8 @@ silero-vad==6.2.1
 Resemblyzer==0.1.4
 # Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
 pyannote.audio>=4.0
+typeguard==4.4.4
+setuptools==80.9.0
 onnxruntime==1.24.4
 torch==2.11.0
 torchaudio==2.11.0
@@ -29,6 +31,6 @@ numpy==2.4.4
 # Audio I/O (used for writing per-session FLAC archives)
 soundfile>=0.12.1
 
-# polycore — shared zero-dep model-residency seam (sibling repo ~/polycore).
+# Livestack model-node kit (sibling repo ~/livestack).
 # Run pip from the polyasr repo root so the relative path resolves on every machine.
--e ../polycore
+-e ../livestack/node-py
