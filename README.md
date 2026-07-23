@@ -232,16 +232,15 @@ launchctl load ~/Library/LaunchAgents/io.zigzag.polyasr.plist
 
 ### NVIDIA CUDA
 
-Install PyTorch for the host CUDA runtime first, then the server deps:
+Install the tested CUDA dependency set. The installer constrains Torch,
+TorchAudio, and TorchVision to matching builds and runs a runtime preflight:
 
 ```bash
-cd cuda
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+./cuda/install.sh
 
 POLYASR_MODEL=Qwen/Qwen3-ASR-1.7B \
 POLYASR_DEVICE=cuda:0 POLYASR_DTYPE=bfloat16 POLYASR_PORT=8766 \
-venv/bin/python server.py
+cuda/venv/bin/python cuda/server.py
 ```
 
 Install as a systemd service:

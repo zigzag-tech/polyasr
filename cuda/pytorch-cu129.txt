@@ -1,0 +1,6 @@
+--index-url https://download.pytorch.org/whl/cu129
+-c constraints-cu129.txt
+
+torch
+torchaudio
+torchvision

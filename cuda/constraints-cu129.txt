@@ -1,0 +1,4 @@
+# Keep the compiled PyTorch libraries on one tested release and CUDA ABI.
+torch==2.11.0+cu129
+torchaudio==2.11.0+cu129
+torchvision==0.26.0+cu129

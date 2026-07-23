@@ -1,32 +1,38 @@
 # CUDA ASR server — Qwen3-ASR on NVIDIA GPU via the official qwen-asr package.
-# Target: zz-tower0 (RTX 3090, CUDA 13). PyTorch CUDA wheels must match the
-# local CUDA runtime — install torch separately via the cu12x index.
+# Target: zz-tower0 (RTX 3090). PyTorch wheels bundle their CUDA user-space
+# runtime, so Torch/TorchAudio/TorchVision must match each other; the NVIDIA
+# driver only needs to support that runtime. Use ./cuda/install.sh.
+-c constraints-cu129.txt
 
 # ASR model (PyTorch/CUDA) — first-party from the Qwen team. Also provides the
 # Qwen3-ForcedAligner integration used by the /v1/align endpoint
 # (Qwen3ASRModel(..., forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")).
-qwen-asr
+qwen-asr==0.0.6
 # Optional native streaming backend: install `qwen-asr[vllm]` and run with
 # POLYASR_BACKEND=vllm after verifying disk space and GPU memory on the host.
 
 # Audio I/O + numerics. ffmpeg (system binary) is required by /v1/align for
 # decoding non-WAV uploads + chunking long audio.
-soundfile
-numpy
+soundfile==0.13.1
+numpy==2.4.4
 
 # Web framework
-fastapi
-uvicorn
-python-multipart
-websockets
+fastapi==0.136.0
+uvicorn==0.46.0
+python-multipart==0.0.26
+websockets==13.1
 
 # VAD and speaker embedding
-silero-vad
-Resemblyzer
-onnxruntime-gpu
+silero-vad==6.2.1
+Resemblyzer==0.1.4
+onnxruntime-gpu==1.24.4
 # Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
-pyannote.audio>=4.0
+pyannote.audio==4.0.5
+# Required by generate-parameter-library-py, whose package metadata omits it.
+typeguard==4.4.4
+# webrtcvad 2.0.10 (via Resemblyzer) still imports pkg_resources.
+setuptools==80.9.0
 
-# polycore — shared zero-dep model-residency seam (sibling repo ~/polycore).
+# Livestack model-node kit (sibling repo ~/livestack).
 # Run pip from the polyasr repo root: pip install -r cuda/requirements.txt
--e ../polycore
+-e ../livestack/node-py

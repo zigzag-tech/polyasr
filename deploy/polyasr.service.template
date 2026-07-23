@@ -2,6 +2,8 @@
 Description=polyasr server (CUDA / Qwen3-ASR + forced aligner)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -28,9 +30,10 @@ Environment=HF_HOME=__HF_HOME__
 Environment=HF_ENDPOINT=https://hf-mirror.com
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
+ExecStartPre=__REPO__/cuda/venv/bin/python __REPO__/cuda/runtime_preflight.py
 ExecStart=__REPO__/cuda/venv/bin/python __REPO__/cuda/server.py
 Restart=on-failure
-RestartSec=5
+RestartSec=30
 StandardOutput=append:__LOG_DIR__/polyasr.log
 StandardError=append:__LOG_DIR__/polyasr.err
 
