@@ -217,6 +217,59 @@ ASR_FRAME_HEADER_BYTES = 16
 ASR_FRAME_TYPE_AUDIO = 1
 ASR_RESUME_TTL_SEC = float(_env("RESUME_TTL_SEC", "300"))
 
+# Control-message protocol. The binary audio FRAMING is unchanged (still
+# ASR_PROTOCOL_VERSION), so a v2 server keeps accepting v1 frames byte for byte;
+# v2 only adds `finalCapturedSeq` on stop and `recognizedThroughSeq` on final.
+# Negotiated per session: a client that asks for v2 gets `control` echoed in the
+# ack, and one that does not stays on v1 semantics.
+ASR_CONTROL_PROTOCOL_VERSION = 2
+
+# How long a completed stop result stays answerable so a reconnecting client
+# gets the SAME transcript instead of provoking a second finalization of one
+# utterance. Past this horizon the server says so explicitly (`stopExpired`)
+# rather than silently decoding again under a stop id it no longer recognizes.
+ASR_STOP_RESULT_TTL_SEC = float(_env("STOP_RESULT_TTL_SEC", "300"))
+
+# How much uncommitted accepted audio must pile up before the server commits a
+# stable recognized prefix. The commit boundary is always a VAD silence
+# boundary (that is the only thing that appends to `gated_audio`), so segments
+# never cut a word and no acoustic overlap has to be carried into the live tail
+# — the bounded overlap the design allows for is zero by construction of the
+# boundary, which is also why the merge needs no text-level dedup guess.
+ASR_STABLE_COMMIT_MIN_SEC = float(_env("STABLE_COMMIT_MIN_SEC", "8"))
+
+
+def join_transcript(prefix: str, suffix: str) -> str:
+    """Concatenate two independently recognized segments.
+
+    Chinese/Japanese/Korean do not use interword spaces, so a separator between
+    two CJK characters is a visible defect; everywhere else one space is right.
+    Decided on the two characters at the seam — never by guessing whether the
+    segments overlap in text, which is the mistake that makes concatenated
+    recognition drop or duplicate words.
+
+    (`_join_text` further down in the MLX server is pre-existing dead code with
+    the same intent and no callers; it predates this change and is left for its
+    owner to remove.)
+    """
+    prefix = (prefix or "").strip()
+    suffix = (suffix or "").strip()
+    if not prefix:
+        return suffix
+    if not suffix:
+        return prefix
+    sep = "" if _is_cjk(prefix[-1]) and _is_cjk(suffix[0]) else " "
+    return f"{prefix}{sep}{suffix}"
+
+
+def _is_cjk(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x4E00 <= cp <= 0x9FFF
+        or 0x3040 <= cp <= 0x30FF
+        or 0xAC00 <= cp <= 0xD7AF
+    )
+
 
 class AsrProtocolSession:
     """In-memory journal for one ASR streaming utterance."""
@@ -241,6 +294,18 @@ class AsrProtocolSession:
         self.native_stream_state = None
         self.final_text = None
         self.final_stop_id = None
+        # Coverage proof for the cached final: the highest contiguous client
+        # chunk that transcript actually includes. None means "this text was not
+        # produced by decoding the accepted audio" (a promoted partial), which a
+        # v2 client must not treat as complete.
+        self.final_recognized_through_seq = None
+        self.final_at = None
+        # Immutable recognized prefix and the byte offset into `gated_audio` it
+        # covers. Everything before `stable_bytes` has been decoded once and is
+        # never decoded again — this is what stops a stop from costing a full
+        # re-transcription of the whole utterance.
+        self.stable_text = ""
+        self.stable_bytes = 0
 
     def accept(self, seq: int, payload: bytes) -> bool:
         self.updated = time.monotonic()
@@ -268,6 +333,8 @@ class AsrProtocolSession:
         raw_signal_bytes: int,
         raw_signal_bytes_at_last_partial: int,
         native_stream_state,
+        stable_text: str = "",
+        stable_bytes: int = 0,
     ) -> None:
         self.updated = time.monotonic()
         self.gated_audio = bytearray(gated_audio)
@@ -281,6 +348,16 @@ class AsrProtocolSession:
         self.raw_signal_bytes = raw_signal_bytes
         self.raw_signal_bytes_at_last_partial = raw_signal_bytes_at_last_partial
         self.native_stream_state = native_stream_state
+        self.stable_text = stable_text
+        self.stable_bytes = stable_bytes
+
+    def stop_result_is_fresh(self, stop_id: str) -> bool:
+        """Can this stop id still be answered from the cache?"""
+        if self.final_text is None or self.final_stop_id != stop_id:
+            return False
+        if self.final_at is None:
+            return False
+        return (time.monotonic() - self.final_at) <= ASR_STOP_RESULT_TTL_SEC
 
 
 _protocol_sessions = {}
@@ -1282,6 +1359,12 @@ GATE_WINDOW_BYTES = int(GATE_WINDOW_SEC * BYTES_PER_SEC)
 COMMIT_SILENCE_WINDOWS = 4       # ~640ms of silence marks a chunk boundary
 MIN_COMMIT_SEC = 1.5             # don't commit chunks shorter than this
 MIN_COMMIT_BYTES = int(MIN_COMMIT_SEC * BYTES_PER_SEC)
+STABLE_COMMIT_MIN_BYTES = int(ASR_STABLE_COMMIT_MIN_SEC * BYTES_PER_SEC)
+# Past this much uncommitted audio the stable commit stops yielding to live
+# partials. Yielding indefinitely is starvation: on a busy session a partial is
+# almost always in flight, the prefix never advances, and stop pays for the
+# whole utterance after all — exactly the cost this is here to remove.
+STABLE_COMMIT_MAX_BYTES = 2 * STABLE_COMMIT_MIN_BYTES
 
 
 def _process_staged_audio(staging, prev_window, gate_state):
@@ -1380,6 +1463,13 @@ async def ws_transcribe(ws: WebSocket):
     protocol_session_id = ""
     protocol_stop_id = ""
     send_lock = asyncio.Lock()
+    # Negotiated per session from the client's `start`/`resume`. v1 clients
+    # never see the coverage fields and keep the exact behaviour they had.
+    control_protocol = 1
+    # Stable recognized prefix (see AsrProtocolSession) and the in-flight commit.
+    stable_text = ""
+    stable_bytes = 0
+    commit_task = None
 
     # ASR context hint (distilled terminal vocabulary, etc.) arrives in the
     # required protocol start/resume message.
@@ -1404,6 +1494,8 @@ async def ws_transcribe(ws: WebSocket):
             raw_signal_bytes=raw_signal_bytes,
             raw_signal_bytes_at_last_partial=raw_signal_bytes_at_last_partial,
             native_stream_state=native_stream_state,
+            stable_text=stable_text,
+            stable_bytes=stable_bytes,
         )
 
     def hydrate_from_protocol_session(sess: AsrProtocolSession) -> None:
@@ -1411,6 +1503,7 @@ async def ws_transcribe(ws: WebSocket):
         nonlocal partial_audio, staging, gate_state
         nonlocal reference_embedding, last_partial_text, raw_signal_bytes
         nonlocal raw_signal_bytes_at_last_partial, native_stream_state
+        nonlocal stable_text, stable_bytes
         gated_audio = bytearray(sess.gated_audio)
         pending_audio = bytearray(sess.pending_audio)
         raw_audio = bytearray(sess.raw_audio())
@@ -1423,6 +1516,9 @@ async def ws_transcribe(ws: WebSocket):
         raw_signal_bytes = sess.raw_signal_bytes
         raw_signal_bytes_at_last_partial = sess.raw_signal_bytes_at_last_partial
         native_stream_state = sess.native_stream_state
+        # A resumed session keeps the work it already paid for.
+        stable_text = sess.stable_text
+        stable_bytes = sess.stable_bytes
 
     async def send_protocol_ack() -> None:
         if protocol_session is None:
@@ -1433,6 +1529,100 @@ async def ws_transcribe(ws: WebSocket):
             "sessionId": protocol_session.session_id,
             "ackSeq": protocol_session.highest_contiguous_seq,
         })
+
+    def recognized_frontier() -> int:
+        """Coverage frontier in the CLIENT's units.
+
+        Two conventions meet here and the difference is one off-by-one away
+        from rejecting every healthy final: `highest_contiguous_seq` is the
+        INCLUSIVE index of the last contiguous chunk, while the client's
+        `finalCapturedSeq` is an EXCLUSIVE count ("chunks 0..N-1 are mine").
+        `recognizedThroughSeq` is reported in the client's units so the
+        comparison it makes — recognizedThroughSeq >= finalCapturedSeq — is
+        between two of the same kind of number.
+        """
+        return protocol_session.highest_contiguous_seq + 1
+
+    async def send_covered_final(
+        final_text: str,
+        recognized_through_seq,
+        *,
+        source: str,
+    ) -> None:
+        """Emit the final with its coverage proof, cache it, then `done`.
+
+        `recognizedThroughSeq` is the highest contiguous client chunk this
+        transcript actually includes. It is OMITTED when the text did not come
+        from decoding the accepted audio — a promoted last partial, say — so a
+        v2 client can tell "here is your utterance" from "here is my best
+        guess", and recover instead of committing the guess. That distinction
+        did not exist on the wire before, which is why a stale partial could
+        arrive in the pane looking exactly like a final.
+        """
+        protocol_session.final_text = final_text
+        protocol_session.final_stop_id = protocol_stop_id
+        protocol_session.final_recognized_through_seq = recognized_through_seq
+        protocol_session.final_at = time.monotonic()
+        protocol_session.updated = time.monotonic()
+        payload = {
+            "type": "final",
+            "sessionId": protocol_session.session_id,
+            "stopId": protocol_stop_id,
+            "text": final_text,
+        }
+        if control_protocol >= 2 and recognized_through_seq is not None:
+            payload["recognizedThroughSeq"] = recognized_through_seq
+        await send_json(payload)
+        slog.event("final_sent", {
+            "stop_id": protocol_stop_id,
+            "source": source,
+            "chars": len(final_text),
+            "recognized_through_seq": recognized_through_seq,
+            "control_protocol": control_protocol,
+        })
+        slog.event("done", {"stop_id": protocol_stop_id})
+        await send_json({
+            "type": "done",
+            "sessionId": protocol_session.session_id,
+            "stopId": protocol_stop_id,
+        })
+
+    async def await_audio_coverage(final_captured_seq) -> bool:
+        """Wait, briefly, for the audio the client says it captured.
+
+        A stop can overtake the last frames on a slow link. Answering before
+        they land would produce a transcript that is missing the end of the
+        sentence while looking complete, so we wait for the contiguous frontier
+        to reach the client's, then report honestly either way.
+        """
+        if final_captured_seq is None:
+            return True
+        deadline = time.monotonic() + 2.0
+        while protocol_session.highest_contiguous_seq < final_captured_seq - 1:
+            if time.monotonic() > deadline:
+                slog.event("stop_audio_incomplete", {
+                    "stop_id": protocol_stop_id,
+                    "have_through_seq": protocol_session.highest_contiguous_seq,
+                    "want_through_seq": final_captured_seq - 1,
+                })
+                return False
+            try:
+                data = await asyncio.wait_for(ws.receive(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                return False
+            if "bytes" not in data:
+                continue
+            decoded = _decode_protocol_audio_frame(data["bytes"])
+            if decoded is None:
+                continue
+            seq, audio_bytes = decoded
+            if protocol_session.accept(seq, audio_bytes):
+                raw_audio.extend(audio_bytes)
+                staging.extend(audio_bytes)
+            await send_protocol_ack()
+        return True
 
     async def emit_partial(text: str, audio_sec: Optional[float] = None) -> None:
         nonlocal last_partial_text, partials_emitted
@@ -1572,6 +1762,110 @@ async def ws_transcribe(ws: WebSocket):
             log.exception("Partial transcription task failed")
             slog.event("partial_error")
 
+    async def run_stable_commit(start: int, upto: int) -> None:
+        """Decode one immutable segment of accepted audio, once."""
+        nonlocal stable_text, stable_bytes
+        segment = bytes(gated_audio[start:upto])
+        began = time.monotonic()
+        text = (
+            await _transcribe_buffer(bytearray(segment), context=asr_context)
+            or ""
+        ).strip()
+        if stable_bytes != start:
+            # Another commit advanced the frontier while we were decoding.
+            slog.event("stable_prefix_superseded", {"start": start})
+            return
+        stable_bytes = upto
+        stable_text = join_transcript(stable_text, text)
+        sync_protocol_session()
+        slog.event("stable_prefix_committed", {
+            "segment_sec": len(segment) / BYTES_PER_SEC,
+            "stable_sec": stable_bytes / BYTES_PER_SEC,
+            "decode_ms": int((time.monotonic() - began) * 1000),
+            "chars": len(text),
+        })
+
+    async def maybe_commit_stable_prefix() -> None:
+        """Advance the immutable recognized prefix during natural silences.
+
+        Everything before `stable_bytes` is decoded exactly once, so a stop only
+        has to seal the unfinished tail. Without this, stop re-transcribed the
+        WHOLE utterance every time — which is what put stopped sessions in a
+        queue behind the global model lock and made stop-to-final latency scale
+        with how long the user spoke rather than with what was left to do.
+
+        Only ever cuts at the end of `gated_audio`, which by construction is a
+        VAD silence boundary: segments never split a word, so the merge needs no
+        overlap and no text-level dedup.
+        """
+        nonlocal commit_task
+        if closing or using_native_stream():
+            return
+        # Deliberately NOT gated on ASR_PARTIALS_ENABLED: partials are about what
+        # the user sees while speaking, this is about what stop has to pay for.
+        # Tying them together made the whole feature inert on any config with
+        # partials off — which is the default here.
+        if commit_task is not None and not commit_task.done():
+            return
+        upto = len(gated_audio)
+        start = stable_bytes
+        uncommitted = upto - start
+        if uncommitted < STABLE_COMMIT_MIN_BYTES:
+            return
+        # Prefer not to contend with a live partial for the model lock — the
+        # user is watching that one — but only up to a point.
+        if (
+            partial_task is not None
+            and not partial_task.done()
+            and uncommitted < STABLE_COMMIT_MAX_BYTES
+        ):
+            return
+        commit_task = asyncio.create_task(run_stable_commit(start, upto))
+        commit_task.add_done_callback(observe_partial_task)
+
+    async def finalize_with_stable_prefix():
+        """Seal the utterance. Returns (text, recognized_through_seq).
+
+        `recognized_through_seq` is None when the text is NOT a decode of the
+        accepted audio — the caller must not present that as covered.
+        """
+        if commit_task is not None and not commit_task.done():
+            try:
+                await commit_task
+            except Exception:
+                log.exception("Stable prefix commit failed before final")
+        tail = bytes(gated_audio[stable_bytes:])
+        tail_text = ""
+        if len(tail) >= int(BYTES_PER_SEC * 0.3):
+            tail_text = (
+                await _transcribe_buffer(bytearray(tail), context=asr_context)
+                or ""
+            ).strip()
+        final_text = join_transcript(stable_text, tail_text)
+        if final_text:
+            slog.event("final_incremental", {
+                "stable_sec": stable_bytes / BYTES_PER_SEC,
+                "tail_sec": len(tail) / BYTES_PER_SEC,
+                "reused_stable": bool(stable_text),
+            })
+            return final_text, recognized_frontier()
+        # Short commands can fall below the VAD commit threshold, leaving
+        # `gated_audio` empty while `raw_audio` holds the whole utterance.
+        if len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
+            final_text = (
+                await _transcribe_buffer(raw_audio, context=asr_context)
+                or ""
+            ).strip()
+            if final_text:
+                slog.event("final_raw_fallback", {"text": final_text})
+                return final_text, recognized_frontier()
+        if last_partial_text:
+            # A guess, and labelled as one: no coverage is returned, so a v2
+            # client refuses it and recovers rather than typing it into a pane.
+            slog.event("final_from_last_partial", {"text": last_partial_text})
+            return last_partial_text, None
+        return "", None
+
     async def maybe_send_partial() -> None:
         nonlocal partial_task
 
@@ -1607,6 +1901,7 @@ async def ws_transcribe(ws: WebSocket):
                     events = _process_staged_audio(staging, prev_window, gate_state)
                     await apply_events(events)
                     await maybe_send_partial()
+                    await maybe_commit_stable_prefix()
                 continue
             except RuntimeError as e:
                 if "disconnect message" in str(e):
@@ -1656,6 +1951,7 @@ async def ws_transcribe(ws: WebSocket):
                     await feed_native_partial(audio_bytes)
                 else:
                     await maybe_send_partial()
+                    await maybe_commit_stable_prefix()
             elif "text" in data:
                 msg = json.loads(data["text"])
                 msg_type = msg.get("type")
@@ -1670,6 +1966,15 @@ async def ws_transcribe(ws: WebSocket):
                             "protocol": msg.get("protocol"),
                         })
                         break
+                    # Version negotiation. `control` is additive: a v1 client
+                    # omits it and gets exactly the v1 wire it always got.
+                    try:
+                        requested_control = int(msg.get("control") or 1)
+                    except (TypeError, ValueError):
+                        requested_control = 1
+                    control_protocol = max(
+                        1, min(requested_control, ASR_CONTROL_PROTOCOL_VERSION)
+                    )
                     protocol_session_id = str(msg.get("sessionId") or "")
                     if not protocol_session_id:
                         await send_json({
@@ -1698,12 +2003,15 @@ async def ws_transcribe(ws: WebSocket):
                         "ack_seq": protocol_session.highest_contiguous_seq,
                         "context_len": len(asr_context),
                     })
-                    await send_json({
+                    started_payload = {
                         "type": "resumed" if msg_type == "resume" else "started",
                         "protocol": ASR_PROTOCOL_VERSION,
                         "sessionId": protocol_session_id,
                         "ackSeq": protocol_session.highest_contiguous_seq,
-                    })
+                    }
+                    if control_protocol >= 2:
+                        started_payload["control"] = control_protocol
+                    await send_json(started_payload)
                     if native_streaming_available() and native_stream_state is None:
                         native_stream_state = init_native_stream(asr_context)
                         sync_protocol_session()
@@ -1722,29 +2030,90 @@ async def ws_transcribe(ws: WebSocket):
                         break
                     closing = True
                     protocol_stop_id = str(msg.get("stopId") or "")
+                    final_captured_seq = msg.get("finalCapturedSeq")
+                    try:
+                        final_captured_seq = (
+                            int(final_captured_seq)
+                            if final_captured_seq is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        final_captured_seq = None
                     slog.event("stop_requested", {
                         "session_id": protocol_session.session_id,
                         "stop_id": protocol_stop_id,
                         "ack_seq": protocol_session.highest_contiguous_seq,
+                        "final_captured_seq": final_captured_seq,
+                        "control_protocol": control_protocol,
                     })
-                    if (
-                        protocol_session.final_text is not None
-                        and protocol_session.final_stop_id == protocol_stop_id
-                    ):
-                        await send_json({
+                    # Reconnect reissues the SAME stop id; answer it from the
+                    # cache so one utterance is finalized once.
+                    if protocol_session.stop_result_is_fresh(protocol_stop_id):
+                        payload = {
                             "type": "final",
                             "sessionId": protocol_session.session_id,
                             "stopId": protocol_stop_id,
                             "text": protocol_session.final_text,
+                        }
+                        seq = protocol_session.final_recognized_through_seq
+                        if control_protocol >= 2 and seq is not None:
+                            payload["recognizedThroughSeq"] = seq
+                        slog.event("stop_result_replayed", {
+                            "stop_id": protocol_stop_id,
                         })
+                        await send_json(payload)
                         await send_json({
                             "type": "done",
                             "sessionId": protocol_session.session_id,
                             "stopId": protocol_stop_id,
                         })
                         break
+                    if (
+                        protocol_session.final_stop_id == protocol_stop_id
+                        and protocol_session.final_text is not None
+                    ):
+                        # We had this result and let it age out. Say so; do not
+                        # quietly run a second, unidentified finalization.
+                        slog.event("stop_result_expired", {
+                            "stop_id": protocol_stop_id,
+                            "ttl_sec": ASR_STOP_RESULT_TTL_SEC,
+                        })
+                        await send_json({
+                            "type": "stopExpired",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                            "reason": "stop_result_expired",
+                        })
+                        break
+                    if (
+                        final_captured_seq is not None
+                        and final_captured_seq > 0
+                        and protocol_session.highest_contiguous_seq < 0
+                        and not protocol_session.chunks
+                    ):
+                        # The client is resuming a stop against a session this
+                        # process no longer holds (pruned, or a different node).
+                        # It owns the audio; tell it so it can recover.
+                        slog.event("stop_session_lost", {
+                            "stop_id": protocol_stop_id,
+                            "want_through_seq": final_captured_seq - 1,
+                        })
+                        await send_json({
+                            "type": "stopExpired",
+                            "sessionId": protocol_session.session_id,
+                            "stopId": protocol_stop_id,
+                            "reason": "session_not_held",
+                        })
+                        break
+                    audio_complete = await await_audio_coverage(final_captured_seq)
                     if using_native_stream():
+                        # The native decoder already recognizes incrementally,
+                        # so its stop only seals the stream — it is the cheap
+                        # path and stays as it was, minus the coverage claim.
                         final_text = await finish_native_stream(native_stream_state)
+                        recognized_through = (
+                            recognized_frontier() if final_text else None
+                        )
+                        source = "native_stream"
                         if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
                             final_text = (
                                 await _transcribe_buffer(raw_audio, context=asr_context)
@@ -1752,30 +2121,27 @@ async def ws_transcribe(ws: WebSocket):
                             ).strip()
                             if final_text:
                                 slog.event("final_raw_fallback", {"text": final_text})
+                                recognized_through = recognized_frontier()
+                                source = "raw_fallback"
                         if not final_text and last_partial_text:
                             final_text = last_partial_text
+                            recognized_through = None
+                            source = "last_partial"
                             slog.event("final_from_last_partial", {"text": final_text})
+                        if not audio_complete:
+                            # We answered without audio the client says it has.
+                            # Never claim coverage we cannot prove.
+                            recognized_through = None
+                            source += "_incomplete_audio"
                         slog.event("final", {
                             "text": final_text,
                             "native_stream": True,
                         })
-                        protocol_session.final_text = final_text
-                        protocol_session.final_stop_id = protocol_stop_id
-                        protocol_session.updated = time.monotonic()
-                        await send_json({
-                            "type": "final",
-                            "sessionId": protocol_session.session_id,
-                            "stopId": protocol_stop_id,
-                            "text": final_text,
-                        })
+                        await send_covered_final(
+                            final_text, recognized_through, source=source,
+                        )
                         if final_text:
                             log.info("Final (native stop): %s", final_text[:80])
-                        slog.event("done", {"stop_id": protocol_stop_id})
-                        await send_json({
-                            "type": "done",
-                            "sessionId": protocol_session.session_id,
-                            "stopId": protocol_stop_id,
-                        })
                         await asyncio.sleep(0.05)
                         break
                     # Flush remaining staged audio, apply boundary events
@@ -1821,41 +2187,23 @@ async def ws_transcribe(ws: WebSocket):
                                 "speaker_sim": sim_val})
                         pending_audio.clear()
 
-                    final_text = ""
-                    # The final must be based on the complete captured audio,
-                    # not a stale early partial. Short commands can be below
-                    # the VAD commit threshold, leaving `gated_audio` empty
-                    # while `raw_audio` contains the full utterance.
-                    if len(gated_audio) >= int(BYTES_PER_SEC * 0.3):
-                        final_text = (await _transcribe_buffer(gated_audio, context=asr_context) or "").strip()
-                    if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
-                        final_text = (
-                            await _transcribe_buffer(raw_audio, context=asr_context)
-                            or ""
-                        ).strip()
-                        if final_text:
-                            slog.event("final_raw_fallback", {"text": final_text})
-                    if not final_text and last_partial_text:
-                        final_text = last_partial_text
-                        slog.event("final_from_last_partial", {"text": final_text})
+                    # Seal only the unfinished tail: everything before the
+                    # stable frontier was decoded once, while the user was
+                    # speaking, and is never decoded again.
+                    final_text, recognized_through = (
+                        await finalize_with_stable_prefix()
+                    )
+                    if not audio_complete:
+                        recognized_through = None
                     slog.event("final", {"text": final_text})
-                    protocol_session.final_text = final_text
-                    protocol_session.final_stop_id = protocol_stop_id
-                    protocol_session.updated = time.monotonic()
-                    await send_json({
-                        "type": "final",
-                        "sessionId": protocol_session.session_id,
-                        "stopId": protocol_stop_id,
-                        "text": final_text,
-                    })
+                    await send_covered_final(
+                        final_text,
+                        recognized_through,
+                        source="incremental" if recognized_through is not None
+                        else "unproven",
+                    )
                     if final_text:
                         log.info("Final (stop): %s", final_text[:80])
-                    slog.event("done", {"stop_id": protocol_stop_id})
-                    await send_json({
-                        "type": "done",
-                        "sessionId": protocol_session.session_id,
-                        "stopId": protocol_stop_id,
-                    })
                     await asyncio.sleep(0.05)
                     break
                 await send_json({
