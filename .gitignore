@@ -6,6 +6,12 @@ asr-venv/
 server.stdout.log
 server.stderr.log
 *.bak
+# Dated rescue copies (server.py.bak.20260610-091558, polyasr_align.py.bak-20260625).
+# `*.bak` alone misses them, so every machine kept offering them to the next sync.
+*.bak.*
+*.bak-*
+# Install transcripts, written next to the thing they installed.
+*_install.log
 .DS_Store
 
 # Per-session audio/event archives (written at runtime for troubleshooting)
