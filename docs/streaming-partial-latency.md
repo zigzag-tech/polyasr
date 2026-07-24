@@ -28,6 +28,38 @@ read. Two independent confirmations:
 
 If you are tuning latency on a `backend=cuda` host, ignore `STREAM_CHUNK_SEC`.
 
+## REVERTED (2026-07-25): the cadence override lost on long-form
+
+The 0.3/0.25 override below was **reverted to upstream defaults**. It was
+validated only on an 11-second clip. On long-form it loses, because partial
+decodes and finalization contend for the same GPU — and each partial decodes a
+window up to `PARTIAL_WINDOW_SEC` (20 s), so the contention grows with utterance
+length precisely where it hurts.
+
+Measured on 37.5 s of speech, warm runs, first run discarded:
+
+| | 0.3 / 0.25 | 0.6 / 0.5 (default) |
+|---|---|---|
+| first partial | 740 ms | 999 ms |
+| partials | 37 | 29 |
+| final after audio, **warm** | 4.1 s | **3.1 s** |
+| final after audio, **COLD** | **13.5 s** | **3.1 s** |
+
+The cold row is the decisive one. At defaults a cold model costs only
+first-partial (1554 ms vs ~990 ms) and finalization is unaffected. With the
+override, a cold model turned finalization into a **13.5-second** wait: twice as
+many decodes while the model is still warming, with the final queued behind
+them. That is the "I wait a very long time and then all the words appear"
+report, reproduced.
+
+**The tension is real and this is its shape.** Faster, more frequent partials
+are not free: they consume the GPU that finalization needs, and the final is
+what gates sending. Optimise the final; let partials be whatever is left.
+
+**Never tune this on a short clip.** An 11-second utterance keeps the decode
+window small and cheap, so it cannot show the contention that dominates real
+dictation.
+
 ## The live knobs: `PARTIAL_INTERVAL_SEC` / `PARTIAL_MIN_DELTA_SEC`
 
 On the CUDA path a partial is gated by *both* a minimum interval since the last

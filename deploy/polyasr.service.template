@@ -32,15 +32,13 @@ Environment=POLYASR_LOG_DIR=__REPO__/cuda/logs
 # cold-start penalty when it does evict is ~1000-1400ms on the next first
 # partial (measured 2120ms cold vs ~970ms warm).
 Environment=POLYASR_IDLE_EVICT_SECONDS=900
-# Live-dictation partial cadence. Defaults (0.6 / 0.5) were measured at ~1000ms
-# to first partial; these at ~713ms (-29%) with ~38% more partials over an 11s
-# utterance and a byte-identical final transcript. Cost is compute duty cycle
-# only — `maybe_send_partial` keeps at most ONE decode in flight, and peak VRAM
-# is set by PARTIAL_WINDOW_SEC (20s), not by cadence: measured flat at 4852 MiB
-# throughout. NOT to be confused with STREAM_CHUNK_SEC, which is inert on this
-# backend (vllm-only path). See docs/streaming-partial-latency.md.
-Environment=POLYASR_PARTIAL_INTERVAL_SEC=0.3
-Environment=POLYASR_PARTIAL_MIN_DELTA_SEC=0.25
+# Partial cadence is left at upstream defaults (PARTIAL_INTERVAL_SEC=0.6,
+# PARTIAL_MIN_DELTA_SEC=0.5). An override to 0.3/0.25 was tried and REVERTED on
+# 2026-07-25 — see docs/streaming-partial-latency.md. It was validated only on an
+# 11s clip; on long-form it bought ~290ms of first-partial and 28% more partials
+# but cost ~0.9s on the FINAL warm, and ~10s COLD (13.5s vs 3.1s), because
+# partial decodes and finalization contend for the same GPU. The final is what
+# gates sending, so the default wins.
 # Hugging Face cache persists across restarts so model reload is fast.
 Environment=HF_HOME=__HF_HOME__
 # huggingface.co is unreachable from CN hosts (SSL EOF). Even via the mirror,
