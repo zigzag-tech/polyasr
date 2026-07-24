@@ -55,6 +55,24 @@ utterance length. On a shared GPU (`cuda:0` also serves polytts) this is real
 contention, and it is the reason not to push these lower without measuring the
 neighbours.
 
+## Residency drift: deployed said 180, the template says 0
+
+Found 2026-07-24 while chasing the phone/bench gap. The generated unit on
+zz-tower0 carried `POLYASR_IDLE_EVICT_SECONDS=180` while
+`deploy/polyasr.service.template` specifies **0**, with a comment stating this
+service backs live dictation and needs the model warm at all times. The deployed
+value contradicted its own documented intent, so every dictation after a
+three-minute pause paid a model reload — and a cold reload is expensive: the
+bench measured **2120 ms cold vs ~970 ms warm** for the identical utterance.
+
+Realigned via the drop-in. Cost is ~4852 MiB pinned on `cuda:0`, which is shared
+with polytts (~6438 MiB) and qwen3vl (~4990 MiB) out of 24576 MiB.
+
+**Do not assume this closes the latency gap.** It does not fit the field data
+cleanly: the user's slowest dictation followed a 78 s gap and their second
+slowest a 168 s gap, both well under the old 180 s threshold. Eviction is at
+most part of the story.
+
 ## Floor, and where the rest of the latency is
 
 ~713 ms is close to the floor this path can give: `PARTIAL_INTERVAL_SEC` plus one
