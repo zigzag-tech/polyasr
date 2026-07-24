@@ -17,9 +17,21 @@ Environment=POLYASR_DTYPE=bfloat16
 Environment=POLYASR_PORT=8766
 Environment=POLYASR_LOG_DIR=__REPO__/cuda/logs
 # Idle-evict the resident model after this many seconds so a co-resident
-# co-resident workload can reclaim the GPU. Default 0 = never evict: this
-# service backs benchday live dictation, which needs the model warm at all times.
-Environment=POLYASR_IDLE_EVICT_SECONDS=0
+# workload can reclaim the GPU. Eviction really does return VRAM: unload() ->
+# free_cuda() -> torch.cuda.empty_cache().
+#
+# This was 0 (never evict) on the theory that live dictation needs the model
+# warm at all times. Measured 2026-07-24, that theory costs more than it buys:
+# across a day of LONG dictations the process grew 4852 -> 12714 MiB and never
+# gave any back, because each partial decodes a window up to PARTIAL_WINDOW_SEC
+# (20s) and the caching allocator keeps its peak. Free VRAM fell to 5.6 GB on a
+# card also holding polytts and qwen3vl. A restart returned it to 4740 MiB.
+#
+# 900s is the compromise: far longer than any gap inside a dictation session, so
+# normal use never goes cold, but memory is released once the user stops. The
+# cold-start penalty when it does evict is ~1000-1400ms on the next first
+# partial (measured 2120ms cold vs ~970ms warm).
+Environment=POLYASR_IDLE_EVICT_SECONDS=900
 # Live-dictation partial cadence. Defaults (0.6 / 0.5) were measured at ~1000ms
 # to first partial; these at ~713ms (-29%) with ~38% more partials over an 11s
 # utterance and a byte-identical final transcript. Cost is compute duty cycle

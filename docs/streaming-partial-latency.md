@@ -65,8 +65,28 @@ value contradicted its own documented intent, so every dictation after a
 three-minute pause paid a model reload — and a cold reload is expensive: the
 bench measured **2120 ms cold vs ~970 ms warm** for the identical utterance.
 
-Realigned via the drop-in. Cost is ~4852 MiB pinned on `cuda:0`, which is shared
-with polytts (~6438 MiB) and qwen3vl (~4990 MiB) out of 24576 MiB.
+Realigned via the drop-in — and then **corrected again**, because `0` turned out
+to be worse than the drift it replaced.
+
+### Never-evict is not free: it grew to 12.7 GB
+
+With `IDLE_EVICT_SECONDS=0`, a day of LONG dictations grew the process from
+**4852 MiB to 12714 MiB**, monotonically. Each partial decodes a trailing window
+up to `PARTIAL_WINDOW_SEC` (20 s), and PyTorch's caching allocator keeps its
+peak; with eviction disabled nothing ever returns it. Free VRAM fell to 5.6 GB
+on a card also holding polytts (~6.4 GB) and qwen3vl (~4.9 GB). A restart
+returned polyasr to 4740 MiB immediately.
+
+An earlier note in this doc claimed cadence does not move peak VRAM ("measured
+flat at 4852 MiB"). That measurement was taken on an **11-second** clip and does
+not generalize — long-form decodes move it a lot. Treat VRAM claims as
+duration-specific.
+
+Settled on **900 s**: longer than any pause inside a dictation session, so normal
+use never goes cold, but memory is released once the user stops. Eviction does
+genuinely free it (`unload()` → `free_cuda()` → `torch.cuda.empty_cache()`). The
+price when it does evict is a cold start, ~1000–1400 ms on the next first
+partial.
 
 **Do not assume this closes the latency gap.** It does not fit the field data
 cleanly: the user's slowest dictation followed a 78 s gap and their second
