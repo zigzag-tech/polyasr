@@ -1,6 +1,11 @@
 # xc-mac-studio MLX host: restart wedge (2026-07-24)
 
-Status: **OPEN**. The MLX ASR server on xc-mac-studio (`io.zigzag.polyasr`,
+Status: **RESOLVED 2026-07-24** — the model cache was moved back to internal storage
+(`~/.cache/huggingface` is a real directory again, not a symlink to `/opt/xc-data`).
+polyasr now restarts under launchd, verified twice, and negotiates protocol v2.
+See "Resolution" at the bottom. Original diagnosis kept below.
+
+Status at the time of writing was: **OPEN**. The MLX ASR server on xc-mac-studio (`io.zigzag.polyasr`,
 `:8765`) does not come back from a restart. The CUDA host (zz-tower0, `:8766`)
 is unaffected and is the client's primary route.
 
@@ -79,3 +84,58 @@ untested. The first restart in two months was the first test, and it failed.
    BEFORE loading, and exit loudly if not. An invisible infinite hang is the
    real defect here; the TCC grant is only its trigger.
 
+
+## Resolution (2026-07-24)
+
+Free space on the internal volume went from ~15 GB to ~127 GB, which made the
+obvious fix available: move the 10 GB HF cache back to internal storage.
+`~/.cache/huggingface` is a real directory again; the old symlink is kept at
+`~/.cache/huggingface.external-symlink.bak` and the external copy is untouched.
+Verified byte-identical before the swap (68 entries, 11,146,604,235 bytes).
+
+polyasr then restarted under **launchd** — the thing that had been impossible —
+healthy with `weights_present: true`, and a live probe shows `control: 2`.
+Restarted a second time to confirm it is repeatable rather than lucky.
+
+### Three things this uncovered
+
+**1. The sentinel had never worked.** `hf-cache-sentinel` could not create its
+canary on the external volume either, so it logged "something is deleting the
+model cache" every 60s — **346 false alerts**, each arming a 900-second
+`eslogger` trace, hunting a deleter that did not exist. It has been silent since
+the move (0 alerts in 140s, first successful canary arm ever).
+
+**2. The models were never actually protected.** `protect` is a manual
+subcommand, not part of the periodic `check`, and it had last run before the
+July 15 move — so the `uchg` flags lived on files that no longer existed. The
+sentinel's own alert text ("the models survived because they are protected") was
+untrue for as long as it had been firing. `protect` has now been re-run and
+verified the hard way: `rm -rf` on a model dir fails with EPERM and the model
+survives intact.
+
+**3. polytts had the same defect, worse.** `~/voxlert` is also a symlink onto
+`/opt/xc-data`, so the launchd agent could not read its own `run.sh` — it
+crash-looped 27 times on `Interrupted system call` / exit 126 the moment it was
+restarted. It had been running since before the July 15 move. Same fix: 8.8 GB
+moved to internal (byte-identical, 71,699 entries), and it now restarts cleanly.
+
+### The general rule
+
+`/opt/xc-data` is an external volume. **Any launchd agent whose program or data
+resolves onto it is un-restartable**, and will keep working indefinitely until
+something makes it reload — at which point it fails in a way that looks like
+anything but a permissions problem. 38 paths in `$HOME` are symlinks onto that
+volume; the two that mattered here are moved. A quick audit for the rest:
+
+    for p in ~/Library/LaunchAgents/*.plist; do
+      # resolve each ProgramArguments path; flag any under /opt/xc-data
+    done
+
+That audit is clean as of this change.
+
+### Still worth doing
+
+The preflight recommendation above stands and is now the only unaddressed item:
+a model load that blocks in `open()` has no deadline, so a liveness-only health
+check reports green straight through it. That is what let all of this stay
+invisible for nine days.
