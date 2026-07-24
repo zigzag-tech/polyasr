@@ -68,13 +68,22 @@ path, not in the server. Tuning the server alone will not close it.
 
 ## Applying / reverting
 
-Config is a systemd drop-in on zz-tower0, deliberately separate from the unit:
+**Durable home: `deploy/polyasr.service.template`.** The tuning is checked in
+there, so a reinstall/redeploy keeps it. This matters more than it looks: the
+values existed only as a hand-written drop-in for a while, and `install.sh` does
+not write drop-ins — so a redeploy would have silently reverted first-partial to
+~1000ms with nothing to explain the regression.
+
+The **live** override on zz-tower0 is a drop-in, deliberately separate from the
+generated unit (editing the template does not touch an already-installed unit):
 
 ```
 /etc/systemd/system/polyasr.service.d/stream-latency.conf
 ```
 
-Revert = delete that file, `systemctl daemon-reload`, `systemctl restart polyasr`.
+Revert = delete that file **and** the two `PARTIAL_*` lines from the template,
+then `systemctl daemon-reload`, `systemctl restart polyasr`. Removing only one
+of the two leaves the other to reassert the tuning on the next deploy.
 A restart evicts the model; `/health` reports `status: ok` with the model
 resident once it is serving again, and the FIRST dictation after a restart pays
 a cold-start penalty (measured 2120 ms vs ~970 ms warm) — discard it when
