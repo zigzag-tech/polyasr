@@ -723,9 +723,13 @@ def _gpu_call(fn):
 # polycore's LocalCoordinator reproduces the standalone COLOAD + idle-evict.
 try:
     from livestack_node import attach
+    # `port` is what lets this node report for duty to the host broker on its
+    # own — no LIVESTACK_PEERS entry, no broker restart. Same value we hand
+    # uvicorn below; the broker cannot infer it, because a POST shows it our
+    # source address, not what we listen on.
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call)
+                                gpu_call=_gpu_call, port=int(_env("PORT", "8766")))
 except ImportError:
     from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
