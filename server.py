@@ -830,9 +830,13 @@ def _gpu_call(fn):
 # standalone COLOAD + idle-evict behaviour unchanged.
 try:
     from livestack_node import attach
+    # `port` is what lets this node report for duty to the host broker on its
+    # own — no LIVESTACK_PEERS entry, no broker restart. It is the one fact the
+    # broker cannot infer (a POST shows it our source address, not what we
+    # listen on), and it is the same value we hand uvicorn at the bottom.
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call)
+                                gpu_call=_gpu_call, port=int(_env("PORT", "8765")))
     log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
 except ImportError:
     manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
