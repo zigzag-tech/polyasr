@@ -982,6 +982,8 @@ async def transcribe(
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         content = await file.read()
+        if not content:
+            raise HTTPException(status_code=422, detail="empty upload: no audio bytes")
         tmp.write(content)
         tmp.flush()
         tmp.close()
@@ -991,10 +993,12 @@ async def transcribe(
         # stall the shared transcribe lock. Best-effort WAV duration; fall back
         # to the full budget if the container can't be measured.
         batch_max_tokens = ASR_MAX_NEW_TOKENS
+        _audio_frames = None
         try:
             import wave as _wave
             with _wave.open(tmp.name, "rb") as _wf:
-                _audio_sec = _wf.getnframes() / float(_wf.getframerate() or 1)
+                _audio_frames = _wf.getnframes()
+                _audio_sec = _audio_frames / float(_wf.getframerate() or 1)
             batch_max_tokens = max(
                 ASR_MIN_NEW_TOKENS,
                 min(
@@ -1004,6 +1008,14 @@ async def transcribe(
             )
         except Exception:
             pass
+        if _audio_frames == 0:
+            # A header-only WAV can never transcribe — "Cannot compute mel
+            # spectrogram of empty audio" as a 500 cost the hub 9 cross-engine
+            # retries per intent (2026-08-31). Unprocessable input is a 4xx:
+            # the caller must NOT retry the same bytes.
+            raise HTTPException(
+                status_code=422, detail="empty audio: WAV contains no frames"
+            )
         kwargs = {"max_new_tokens": batch_max_tokens}
         if language:
             kwargs["language"] = language
@@ -1041,6 +1053,10 @@ async def transcribe(
         # so callers should route to another node rather than retry here.
         log.critical("ASR model unavailable (batch): %s", e)
         raise HTTPException(status_code=503, detail=f"asr model unavailable: {e}")
+    except HTTPException:
+        # Deliberate 4xx (empty/undecodable input): keep the status; the
+        # catch-all below would otherwise re-map it to a retryable 500.
+        raise
     except Exception as e:
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
