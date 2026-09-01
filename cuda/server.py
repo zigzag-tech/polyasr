@@ -823,9 +823,27 @@ async def transcribe(
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         content = await file.read()
+        if not content:
+            raise HTTPException(status_code=422, detail="empty upload: no audio bytes")
         tmp.write(content)
         tmp.flush()
         tmp.close()
+
+        # A header-only WAV can never transcribe (the CUDA stack fails it with
+        # a tensor-shape error). Unprocessable input is a 4xx, not a 500: the
+        # benchday hub treats 500 as retryable and burned 9 cross-engine
+        # attempts per such intent on 2026-08-31.
+        try:
+            import wave as _wave
+            with _wave.open(tmp.name, "rb") as _wf:
+                if _wf.getnframes() == 0:
+                    raise HTTPException(
+                        status_code=422, detail="empty audio: WAV contains no frames"
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # not a WAV — the engine arbitrates containers we don't parse
 
         kwargs = {"audio": tmp.name}
         if language:
@@ -856,6 +874,10 @@ async def transcribe(
             })
         else:
             return JSONResponse({"text": text})
+    except HTTPException:
+        # Deliberate 4xx (empty/undecodable input): keep the status; the
+        # catch-all below would otherwise re-map it to a retryable 500.
+        raise
     except Exception as e:
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
