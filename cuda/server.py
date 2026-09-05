@@ -32,6 +32,7 @@ import asyncio
 import tempfile
 import logging
 import wave
+import contextlib
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +106,34 @@ _voice_encoder = None
 # transcription. get_session()/manager.ensure() are always called while holding
 # it (or from within a run_transcribe closure that holds it).
 _transcribe_lock = threading.Lock()
+
+# How many transcription requests are being served right now. Reported on the
+# livestack readiness descriptor as `load.in_flight` so a client picking between
+# engines can tell a busy one from an idle one BEFORE latency says so — latency
+# only reports saturation after somebody's request was the one that waited.
+#
+# This has to be counted here rather than derived from livestack leases. The
+# batch and websocket paths reach the model through `manager.ensure`, which
+# takes a `__usage__:` lease; those leases mark recency, not work, and they live
+# for the whole idle-evict TTL (900 s here). Counting them would report this node
+# busy for fifteen minutes after a single request, and NOT counting them — which
+# is correct — leaves real concurrent work invisible. Measured on
+# xc-tower-ubuntu: six concurrent transcriptions, `in_flight` stuck at 0.
+_in_flight_lock = threading.Lock()
+_in_flight_count = 0
+
+
+@contextlib.contextmanager
+def _in_flight():
+    """Count one request for the duration of its handler."""
+    global _in_flight_count
+    with _in_flight_lock:
+        _in_flight_count += 1
+    try:
+        yield
+    finally:
+        with _in_flight_lock:
+            _in_flight_count -= 1
 
 # -------------------------------------------------------------------------
 # Session logging: audio + events are archived per-session for troubleshooting
@@ -727,9 +756,18 @@ try:
     # own — no LIVESTACK_PEERS entry, no broker restart. Same value we hand
     # uvicorn below; the broker cannot infer it, because a POST shows it our
     # source address, not what we listen on.
+    def _readiness() -> dict:
+        """Only `load` is supplied. The facade's own `ready`/`detail` (model
+        resident + its functional probe) is already the right answer, and
+        overriding it here would replace a checked verdict with a guess."""
+        with _in_flight_lock:
+            n = _in_flight_count
+        return {"load": {"in_flight": n}}
+
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call, port=int(_env("PORT", "8766")))
+                                gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
+                                readiness=_readiness)
 except ImportError:
     from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -818,6 +856,11 @@ async def transcribe(
     context: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
 ):
+    with _in_flight():
+        return await _transcribe_impl(file, model, language, context, response_format)
+
+
+async def _transcribe_impl(file, model, language, context, response_format):
     t0 = time.monotonic()
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -1219,6 +1262,11 @@ def _process_staged_audio(staging, prev_window, gate_state):
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
+    with _in_flight():
+        await _ws_transcribe_impl(ws)
+
+
+async def _ws_transcribe_impl(ws: WebSocket):
     await ws.accept()
     log.info("WebSocket client connected")
 
