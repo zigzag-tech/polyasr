@@ -756,18 +756,18 @@ try:
     # own — no LIVESTACK_PEERS entry, no broker restart. Same value we hand
     # uvicorn below; the broker cannot infer it, because a POST shows it our
     # source address, not what we listen on.
-    def _readiness() -> dict:
-        """Only `load` is supplied. The facade's own `ready`/`detail` (model
-        resident + its functional probe) is already the right answer, and
-        overriding it here would replace a checked verdict with a guess."""
+    # `in_flight` is now a first-class attach() argument rather than something
+    # smuggled through `readiness()`. The facade labels it
+    # `load.in_flight_source: "server"`, which is the part a consumer needs: it
+    # tells 0-because-idle apart from 0-because-this-node-cannot-see-its-work.
+    def _count() -> int:
         with _in_flight_lock:
-            n = _in_flight_count
-        return {"load": {"in_flight": n}}
+            return _in_flight_count
 
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
-                                readiness=_readiness)
+                                in_flight=_count)
 except ImportError:
     from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)

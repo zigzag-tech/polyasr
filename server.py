@@ -43,7 +43,7 @@ _REPO_ROOT = str(Path(__file__).resolve().parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 from livestack_node import (ModelManager as AsrModelManager, ManagedUnit, ResidencyPolicy,  # noqa: E402
-                      free_mlx, trim_ram)
+                      counting, free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 
@@ -102,13 +102,30 @@ from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 _gpu_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 
 
+# How busy this node is, reported to the broker and to client pickers via
+# `attach(in_flight=)` -> `/livestack/capability` `load.in_flight`. It has to be
+# counted here rather than derived from livestack leases: transcription reaches
+# the model through `manager.ensure`, which takes a `__usage__:` lease that
+# marks recency rather than work and lives for the whole idle-evict TTL. Counting
+# those would report the node busy for the whole window after one request; not
+# counting them (which is correct) leaves real concurrent work invisible.
+#
+# The measure is GPU-QUEUE DEPTH, not request count: `_gpu_executor` has exactly
+# one worker, so everything awaiting it is either running or queued behind the
+# one that is. That is the number a consumer's picker actually wants — it is what
+# `MeshRoutePicker` normalizes as `in_flight` — and unlike a request count it
+# also sees keep-warm and eviction work, which occupies the card just as much.
+_busy = counting()
+
+
 async def _run_on_gpu(fn, *args, **kwargs):
     """Await a blocking MLX call on the single GPU worker thread."""
     loop = asyncio.get_event_loop()
     if kwargs:
         from functools import partial as _partial
         fn = _partial(fn, **kwargs)
-    return await loop.run_in_executor(_gpu_executor, fn, *args)
+    async with _busy:
+        return await loop.run_in_executor(_gpu_executor, fn, *args)
 
 
 # Monotonic timestamp of the most recent transcription, used by the keep-warm
@@ -836,7 +853,8 @@ try:
     # listen on), and it is the same value we hand uvicorn at the bottom.
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call, port=int(_env("PORT", "8765")))
+                                gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
+                                in_flight=_busy)
     log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
 except ImportError:
     manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
