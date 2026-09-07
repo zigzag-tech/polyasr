@@ -24,6 +24,7 @@ The client half of this contract lives in
 import json
 import os
 import struct
+import sys
 
 import pytest
 
@@ -32,7 +33,17 @@ os.environ.setdefault("POLYASR_PARTIAL_INTERVAL_SEC", "0.05")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-import server  # noqa: E402
+# The two servers implement ONE wire contract — cuda/server.py's own header says
+# "Same HTTP/WS contract as the MLX server so clients are interchangeable" — and
+# this file tests the contract, not a backend. Import whichever one this machine
+# can run: `import server` alone made the whole suite silently Mac-only, while
+# the CUDA build is what serves the Linux GPU hosts and is where the coverage
+# defect below was found.
+try:
+    import server  # noqa: E402
+except ModuleNotFoundError:  # no mlx here — fall back to the CUDA build
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda"))
+    import server  # noqa: E402
 
 BYTES_PER_SEC = server.BYTES_PER_SEC
 CHUNK_BYTES = 3200  # 100ms, the client's PCM chunk size
@@ -379,3 +390,159 @@ def test_concurrent_stops_do_not_queue_full_utterance_decodes(client, decoder):
         f"a stop decoded {stop_cost:.1f}s at once; concurrent stops are still "
         "each paying for the whole utterance"
     )
+
+
+# --- coverage means decoded, not received -------------------------------------
+#
+# Regression corpus for the defect these were written from. Reproduced from the
+# engine's own session log, zz-tower0
+# logs/sessions/2026-09-08/054546-ws-9e2fee7e/events.jsonl:
+#
+#   t=8832  partial  "...and then comes back. Figure out why."
+#   t=9158  boundary_short  pending_bytes=40960   <- 1.28s of speech, DISCARDED
+#   t=11375 final    "...and then comes back."
+#           final_sent  recognized_through_seq=146  == finalCapturedSeq
+#
+# A shortened transcript wearing a proof of completeness. Both halves get a test:
+# the audio must reach the decoder, and where it cannot, the proof must fail.
+
+
+def send_speech(ws, seconds: float, seq: int) -> int:
+    chunks = int(seconds * BYTES_PER_SEC / CHUNK_BYTES)
+    for _ in range(chunks):
+        ws.send_bytes(audio_frame(seq, speech(CHUNK_BYTES)))
+        seq += 1
+    return seq
+
+
+def send_silence(ws, seconds: float, seq: int) -> int:
+    chunks = int(seconds * BYTES_PER_SEC / CHUNK_BYTES)
+    for _ in range(chunks):
+        ws.send_bytes(audio_frame(seq, silence(CHUNK_BYTES)))
+        seq += 1
+    return seq
+
+
+def test_short_trailing_clause_reaches_the_decoder(client, decoder):
+    """"Figure out why." — 1.0s of speech, below MIN_COMMIT_SEC, at the end.
+
+    Before the fix `boundary_short` cleared it and stop decoded nothing extra,
+    so the tail cost ~0s and the words were simply gone.
+    """
+    spy = decoder
+    assert 1.0 < server.MIN_COMMIT_SEC, "this test needs a sub-commit clause"
+    # Total speech stays under STABLE_COMMIT_MIN_SEC so nothing is committed to
+    # the stable prefix: the stop-time tail is then the WHOLE gated buffer, and
+    # its length says exactly whether the clause survived the gate.
+    #   discarded (before) -> 3.0s     kept (after) -> 4.0s
+    assert 4.0 < server.ASR_STABLE_COMMIT_MIN_SEC
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-tail")
+        seq = send_speech(ws, 3.0, 0)
+        seq = send_silence(ws, 1.0, seq)      # commit boundary for the 3s chunk
+        seq = send_speech(ws, 1.0, seq)       # the short trailing clause
+        seq = send_silence(ws, 1.0, seq)      # boundary the clause cannot meet
+        at_stop = spy.mark()
+        ws.send_text(json.dumps({
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-tail",
+            "stopId": "sess-tail-stop-1",
+            "finalCapturedSeq": seq,
+        }))
+        final = drain_until(ws, "final")
+
+    tail_decoded = spy.max_seconds_since(at_stop)
+    assert tail_decoded >= 3.9, (
+        f"stop decoded {tail_decoded:.2f}s of 4.0s of speech; the sub-commit "
+        "trailing clause was dropped before it reached the decoder"
+    )
+    assert final["recognizedThroughSeq"] == seq, (
+        "the clause was decoded, so the final covers everything captured"
+    )
+
+
+def test_a_discarded_span_cannot_report_full_coverage(client, monkeypatch):
+    """A speaker-rejected chunk must cost the coverage claim, not the words.
+
+    The policy itself is not on trial here: what is forbidden is removing audio
+    from the transcript while still telling the client the transcript is whole.
+    """
+    import numpy as np  # only this test needs it
+
+    calls = {"n": 0}
+
+    def alternating_embedding(pcm_bytes):
+        # First committed chunk enrolls; the next scores far below threshold.
+        calls["n"] += 1
+        vec = np.zeros(4, dtype=np.float32)
+        vec[0 if calls["n"] == 1 else 1] = 1.0
+        return vec
+
+    async def fake_decode(audio_buffer, context=""):
+        return "text" if len(audio_buffer) else ""
+
+    monkeypatch.setattr(server, "_transcribe_buffer", fake_decode)
+    monkeypatch.setattr(server, "compute_embedding", alternating_embedding)
+    monkeypatch.setattr(
+        server, "vad_speech_prob", lambda pcm: 0.0 if not any(pcm) else 1.0
+    )
+
+    with TestClient(server.app) as client_:
+        with client_.websocket_connect("/ws/transcribe") as ws:
+            start(ws, "sess-reject")
+            seq = send_speech(ws, 3.0, 0)     # enrolls the reference
+            seq = send_silence(ws, 1.0, seq)
+            seq = send_speech(ws, 3.0, seq)   # rejected: different speaker
+            seq = send_silence(ws, 1.0, seq)
+            ws.send_text(json.dumps({
+                "type": "stop",
+                "protocol": server.ASR_PROTOCOL_VERSION,
+                "sessionId": "sess-reject",
+                "stopId": "sess-reject-stop-1",
+                "finalCapturedSeq": seq,
+            }))
+            final = drain_until(ws, "final")
+
+    covered = final.get("recognizedThroughSeq")
+    assert covered is None or covered < seq, (
+        f"reported coverage {covered} of {seq} chunks after discarding a span: "
+        "this is the truncated-transcript-with-a-completeness-proof defect"
+    )
+
+
+# CoverageLedger is a pure decision function, and these are the two properties
+# no end-to-end case states outright: the frontier FREEZES on the first discard
+# (it must never advance past a hole), and the replayed attack window is not
+# counted twice (a drifting ledger would report coverage for bytes that do not
+# exist). Kept as units for that reason, per the testing-strategy rule.
+def test_ledger_freezes_at_the_first_discard():
+    led = server.CoverageLedger()
+    led.note_silence(100)
+    led.note_speech(200)
+    led.commit_segment()
+    assert led.covered_through_bytes() == 300
+
+    led.note_speech(400)
+    led.discard_segment()
+    frozen_at = led.covered_through_bytes()
+    assert frozen_at == 300, "the discarded span must not be claimed"
+
+    # Everything afterwards is decoded, and it still cannot be claimed: coverage
+    # is a prefix property, so reporting past the hole would be the same lie.
+    led.note_silence(50)
+    led.note_speech(600)
+    led.commit_segment()
+    assert led.covered_through_bytes() == frozen_at
+
+
+def test_ledger_does_not_count_the_attack_window_twice():
+    led = server.CoverageLedger()
+    led.note_silence(160)          # window held as the attack buffer
+    led.note_speech(160, replayed=True)   # same bytes, re-emitted as speech
+    led.note_speech(320)
+    led.commit_segment()
+    # 160 silence + 320 speech actually crossed the gate.
+    assert led.covered_through_bytes() == 480
+    # And the segment is credited from where the onset really began.
+    assert led.consumed == 480

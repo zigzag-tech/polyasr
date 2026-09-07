@@ -1221,10 +1221,114 @@ STABLE_COMMIT_MIN_BYTES = int(ASR_STABLE_COMMIT_MIN_SEC * BYTES_PER_SEC)
 STABLE_COMMIT_MAX_BYTES = 2 * STABLE_COMMIT_MIN_BYTES
 
 
+class CoverageLedger:
+    """Which received audio a transcript can honestly claim to include.
+
+    `recognizedThroughSeq` is a promise to the client that the returned text is
+    a decode of the audio it captured. The receive frontier
+    (`highest_contiguous_seq`) cannot make that promise: this server decodes
+    `gated_audio`, and the VAD/speaker gates drop speech on the way there. A
+    final assembled from a subset, reported at the receive frontier, is a
+    truncated transcript wearing a proof of completeness — which is exactly how
+    "Sometimes the title bar disappears briefly and then comes back." was
+    delivered without its "Figure out why."
+
+    So coverage is tracked in RAW-STREAM BYTE OFFSETS as audio passes the gate:
+
+      silence         -> covered (there was nothing to decode)
+      speech committed-> covered (it is in `gated_audio`, which the final decodes)
+      speech discarded-> the frontier FREEZES at that point, forever
+
+    Freezing is deliberate. Coverage is a prefix property: reporting past a hole
+    would be the same lie in a smaller place. A frozen ledger makes the final
+    read as uncovered, and an uncovered final is a case the client already
+    handles — it recovers. Losing a clause silently is not.
+    """
+
+    def __init__(self):
+        # Bytes that have left `staging` and been classified by the VAD gate.
+        self.consumed = 0
+        # Frontier: every raw byte below this is decoded-or-silence.
+        self.covered = 0
+        # Where the open speech segment started, or None between segments.
+        self.segment_start = None
+        # Byte offset of the silence window held as the attack buffer, so a
+        # segment that opens with a replayed onset starts where the onset did.
+        self.attack_start = None
+        # Set by the first discard. The frontier never advances again.
+        self.frozen = False
+
+    def note_silence(self, nbytes: int) -> None:
+        self.attack_start = self.consumed
+        self.consumed += nbytes
+        if self.segment_start is None and not self.frozen:
+            self.covered = self.consumed
+
+    def note_speech(self, nbytes: int, *, replayed: bool = False) -> None:
+        """A speech window entered the pending segment.
+
+        `replayed` marks the attack buffer — a silence window already counted by
+        `note_silence` and now re-emitted as audio. Counting its bytes twice
+        would drift the ledger past the real stream.
+        """
+        if self.segment_start is None:
+            self.segment_start = (
+                self.attack_start if replayed else self.consumed
+            )
+        if not replayed:
+            self.consumed += nbytes
+
+    def commit_segment(self) -> None:
+        """The open segment is in `gated_audio`, so the final will decode it."""
+        self.segment_start = None
+        if not self.frozen:
+            self.covered = self.consumed
+
+    def discard_segment(self) -> None:
+        """The open segment was dropped. Nothing after it can be claimed."""
+        self.segment_start = None
+        self.frozen = True
+
+    def note_undecided(self, nbytes: int) -> None:
+        """Audio that reached us but never reached the gate at all."""
+        self.consumed += nbytes
+        self.frozen = True
+
+    def covered_through_bytes(self) -> int:
+        return self.covered
+
+
+def _seq_for_covered_bytes(session, covered_bytes: int) -> int:
+    """Highest contiguous chunk seq fully inside `covered_bytes`, client units.
+
+    Client units are an EXCLUSIVE count ("chunks 0..N-1 are mine"), which is why
+    this returns `seq + 1` — the same convention `recognized_frontier()` has
+    always reported, so a healthy full-coverage final still compares equal.
+
+    Chunks are measured in seq order over the contiguous prefix, while
+    `covered_bytes` counts bytes in ARRIVAL order. Those agree unless chunks
+    arrived out of order, in which case this under-reports and the final reads
+    as uncovered — the safe direction.
+    """
+    total = 0
+    covered_seq = -1
+    for seq in range(0, session.highest_contiguous_seq + 1):
+        chunk = session.chunks.get(seq)
+        if chunk is None:
+            break
+        if total + len(chunk) > covered_bytes:
+            break
+        total += len(chunk)
+        covered_seq = seq
+    return covered_seq + 1
+
+
 def _process_staged_audio(staging, prev_window, gate_state):
     """Split *staging* into fixed-size windows and classify each with
     Silero VAD. Emits events:
-      ('audio', bytes) — a window containing speech
+      ('audio', bytes, replayed) — a window containing speech; `replayed` marks
+                        the attack buffer, whose bytes are already accounted for
+      ('silence', nbytes)        — a window with no speech
       ('boundary',)    — silence run long enough to mark a chunk boundary
 
     A one-window attack buffer (prev_window) is prepended when speech
@@ -1242,12 +1346,16 @@ def _process_staged_audio(staging, prev_window, gate_state):
 
         if is_speech:
             if prev_window:
-                events.append(('audio', prev_window[0]))
+                # The attack buffer: a silence window already accounted for,
+                # replayed so the onset isn't clipped. Marked so the coverage
+                # ledger does not count its bytes a second time.
+                events.append(('audio', prev_window[0], True))
                 prev_window.clear()
-            events.append(('audio', window))
+            events.append(('audio', window, False))
             gate_state['silence_run'] = 0
             gate_state['gate_was_open'] = True
         else:
+            events.append(('silence', len(window)))
             prev_window.clear()
             prev_window.append(window)
             if gate_state.get('gate_was_open'):
@@ -1291,6 +1399,11 @@ async def _ws_transcribe_impl(ws: WebSocket):
     staging = bytearray()
     prev_window = []
     gate_state = {'silence_run': 0, 'gate_was_open': False}
+    # What this connection may honestly claim to have decoded. See CoverageLedger.
+    ledger = CoverageLedger()
+    # Late frames collected during the stop-time audio wait, for the native
+    # decoder — which reads what it is handed, not the staging buffer.
+    native_pending_feed = bytearray()
     reference_embedding = None
     last_partial_time = time.monotonic()
     last_partial_text = ""
@@ -1312,6 +1425,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
     stable_text = ""
     stable_bytes = 0
     commit_task = None
+    # Highest `upto` whose commit decoded to nothing. Retrying the identical
+    # range would spin; the range has to grow before it is worth another pass.
+    stable_commit_empty_upto = 0
 
     # ASR context hint (distilled terminal vocabulary, etc.).  Received as
     # part of the required protocol start/resume message before audio frames.
@@ -1372,18 +1488,37 @@ async def _ws_transcribe_impl(ws: WebSocket):
             "ackSeq": protocol_session.highest_contiguous_seq,
         })
 
-    def recognized_frontier() -> int:
-        """Coverage frontier in the CLIENT's units.
+    def received_frontier() -> int:
+        """Everything that ARRIVED, in the client's units.
 
         Two conventions meet here and the difference is one off-by-one away
         from rejecting every healthy final: `highest_contiguous_seq` is the
         INCLUSIVE index of the last contiguous chunk, while the client's
         `finalCapturedSeq` is an EXCLUSIVE count ("chunks 0..N-1 are mine").
-        `recognizedThroughSeq` is reported in the client's units so the
+        Both frontiers below are reported in the client's units so the
         comparison it makes — recognizedThroughSeq >= finalCapturedSeq — is
         between two of the same kind of number.
+
+        This answers a question about ARRIVAL and is the right number for the
+        stop-time audio wait. It is NOT coverage; see `recognized_frontier`.
         """
         return protocol_session.highest_contiguous_seq + 1
+
+    def recognized_frontier() -> int:
+        """Coverage frontier in the CLIENT's units: what the DECODER read.
+
+        This used to return `received_frontier()`, which promised the client
+        that the transcript covered every chunk that arrived. It does not: the
+        final is assembled from `gated_audio`, and the gates above drop speech
+        on the way there. The ledger tracks what actually survived to the
+        decoder, so a dropped segment leaves this behind `finalCapturedSeq` and
+        the client recovers rather than typing a shortened transcript.
+        """
+        if protocol_session is None:
+            return 0
+        return _seq_for_covered_bytes(
+            protocol_session, ledger.covered_through_bytes()
+        )
 
     async def send_covered_final(
         final_text: str,
@@ -1463,6 +1598,10 @@ async def _ws_transcribe_impl(ws: WebSocket):
             if protocol_session.accept(seq, audio_bytes):
                 raw_audio.extend(audio_bytes)
                 staging.extend(audio_bytes)
+                # The native decoder is fed explicitly, not from `staging`;
+                # hold this for the seal so late frames are not merely stored.
+                if using_native_stream():
+                    native_pending_feed.extend(audio_bytes)
             await send_protocol_ack()
         return True
 
@@ -1501,14 +1640,24 @@ async def _ws_transcribe_impl(ws: WebSocket):
     async def apply_events(events):
         nonlocal reference_embedding
         for ev in events:
-            if ev[0] == 'audio':
+            if ev[0] == 'silence':
+                ledger.note_silence(ev[1])
+            elif ev[0] == 'audio':
+                ledger.note_speech(len(ev[1]), replayed=ev[2])
                 pending_audio.extend(ev[1])
                 partial_audio.extend(ev[1])
             elif ev[0] == 'boundary':
                 if len(pending_audio) < MIN_COMMIT_BYTES:
-                    slog.event("boundary_short", {
+                    # DEFER, do not delete. A segment this short is a poor unit
+                    # to run a speaker embedding on (MIN_EMBED_SEC), which is
+                    # the only reason the boundary is refused — the audio itself
+                    # is speech and belongs in the transcript. Clearing it here
+                    # is how a trailing "Figure out why." disappeared while the
+                    # partial that showed it was already on screen. Keeping it
+                    # pending coalesces it into the next segment, or into the
+                    # final tail at stop.
+                    slog.event("boundary_deferred", {
                         "pending_bytes": len(pending_audio)})
-                    pending_audio.clear()
                     continue
 
                 # Speaker check (off-thread — embedding takes ~30-50ms).
@@ -1539,15 +1688,24 @@ async def _ws_transcribe_impl(ws: WebSocket):
 
                 if accept:
                     gated_audio.extend(pending_audio)
+                    ledger.commit_segment()
                     slog.event("chunk_accepted", {
                         "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
                         "speaker_sim": sim_val,
                         "gated_sec": len(gated_audio) / BYTES_PER_SEC,
                     })
                 else:
+                    # The speaker policy still applies — but it is removing
+                    # speech from the transcript, so this final can no longer
+                    # claim to cover the audio the client captured. The ledger
+                    # freezes, the final reads as uncovered, and the client
+                    # recovers over the whole recording instead of being handed
+                    # a shortened transcript stamped complete.
+                    ledger.discard_segment()
                     slog.event("reject", {
                         "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
-                        "speaker_sim": sim_val})
+                        "speaker_sim": sim_val,
+                        "coverage_frozen": True})
 
                 pending_audio.clear()
 
@@ -1605,7 +1763,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
 
     async def run_stable_commit(start: int, upto: int) -> None:
         """Decode one immutable segment of accepted audio, once."""
-        nonlocal stable_text, stable_bytes
+        nonlocal stable_text, stable_bytes, stable_commit_empty_upto
         segment = bytes(gated_audio[start:upto])
         began = time.monotonic()
         text = (
@@ -1615,6 +1773,17 @@ async def _ws_transcribe_impl(ws: WebSocket):
         if stable_bytes != start:
             # Another commit advanced the frontier while we were decoding.
             slog.event("stable_prefix_superseded", {"start": start})
+            return
+        if not text:
+            # An empty decode is not a decoded prefix. Advancing on it retires
+            # audio that no transcript represents — a swallowed failure inside
+            # `_transcribe_buffer` looks exactly like this — so leave the
+            # segment in the unfinished tail, where the final pass decodes it.
+            stable_commit_empty_upto = upto
+            slog.event("stable_prefix_empty", {
+                "segment_sec": len(segment) / BYTES_PER_SEC,
+                "decode_ms": int((time.monotonic() - began) * 1000),
+            })
             return
         stable_bytes = upto
         stable_text = join_transcript(stable_text, text)
@@ -1653,6 +1822,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
         uncommitted = upto - start
         if uncommitted < STABLE_COMMIT_MIN_BYTES:
             return
+        if upto - stable_commit_empty_upto < STABLE_COMMIT_MIN_BYTES:
+            # This range already decoded to nothing; wait for more audio.
+            return
         # Prefer not to contend with a live partial for the model lock — the
         # user is watching that one — but only up to a point.
         if (
@@ -1677,7 +1849,10 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 log.exception("Stable prefix commit failed before final")
         tail = bytes(gated_audio[stable_bytes:])
         tail_text = ""
-        if len(tail) >= int(BYTES_PER_SEC * 0.3):
+        # No length floor: the tail is the end of the utterance and a floor here
+        # silently drops a short last word. The decoder is the judge of whether
+        # there are words in it.
+        if tail:
             tail_text = (
                 await _transcribe_buffer(bytearray(tail), context=asr_context)
                 or ""
@@ -1942,9 +2117,18 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         # The native decoder already recognizes incrementally,
                         # so its stop only seals the stream — it is the cheap
                         # path and stays as it was, minus the coverage claim.
+                        # Audio that arrived during the stop-time wait was
+                        # appended to the buffers but never handed to the native
+                        # decoder; feed it before sealing, or the transcript is
+                        # missing the very tail the wait existed to collect.
+                        if native_pending_feed:
+                            await feed_native_partial(bytes(native_pending_feed))
+                            native_pending_feed.clear()
                         final_text = await finish_native_stream(native_stream_state)
+                        # The native decoder consumes every chunk it is fed, so
+                        # what it read IS what arrived.
                         recognized_through = (
-                            recognized_frontier() if final_text else None
+                            received_frontier() if final_text else None
                         )
                         source = "native_stream"
                         if not final_text and len(raw_audio) >= int(BYTES_PER_SEC * 0.3):
@@ -1954,7 +2138,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
                             ).strip()
                             if final_text:
                                 slog.event("final_raw_fallback", {"text": final_text})
-                                recognized_through = recognized_frontier()
+                                # A decode of the RAW stream covers everything
+                                # that arrived, by construction.
+                                recognized_through = received_frontier()
                                 source = "raw_fallback"
                         if not final_text and last_partial_text:
                             final_text = last_partial_text
@@ -1979,6 +2165,18 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         break
                     events = _process_staged_audio(staging, prev_window, gate_state)
                     await apply_events(events)
+                    # Whatever is left in `staging` is shorter than one VAD
+                    # window and can never be classified — but it is the END of
+                    # the utterance, and dropping it silently was one of the
+                    # ways a last word went missing. Stop does not need the VAD:
+                    # the tail below is decoded regardless of gating.
+                    if staging:
+                        remainder = bytes(staging)
+                        staging.clear()
+                        pending_audio.extend(remainder)
+                        ledger.note_speech(len(remainder))
+                        slog.event("stop_staging_remainder", {
+                            "bytes": len(remainder)})
                     if partial_task is not None and not partial_task.done():
                         if ASR_FINAL_WAIT_PARTIAL:
                             slog.event("final_wait_partial")
@@ -1989,10 +2187,11 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         else:
                             slog.event("final_skip_partial")
 
-                    # Tail: if pending has enough speech, speaker-check
-                    # and (if accepted) roll it into gated_audio before
-                    # the final transcription pass.
-                    if len(pending_audio) > BYTES_PER_SEC * 0.3:
+                    # Tail: roll the open segment into gated_audio before the
+                    # final pass. There is no length floor here any more — a
+                    # 0.3 s floor discards a whole short word ("yes", "do it"),
+                    # and at stop there is no later segment for it to join.
+                    if pending_audio:
                         chunk_bytes = bytes(pending_audio)
                         accept = True
                         sim_val = None
@@ -2009,14 +2208,19 @@ async def _ws_transcribe_impl(ws: WebSocket):
                                     )
                         if accept:
                             gated_audio.extend(pending_audio)
+                            ledger.commit_segment()
                             sync_protocol_session()
                             slog.event("final_tail_accepted", {
                                 "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
                                 "speaker_sim": sim_val})
                         else:
+                            # Same rule as a mid-utterance rejection: the policy
+                            # stands, the coverage claim does not.
+                            ledger.discard_segment()
                             slog.event("final_tail_reject", {
                                 "chunk_sec": len(chunk_bytes) / BYTES_PER_SEC,
-                                "speaker_sim": sim_val})
+                                "speaker_sim": sim_val,
+                                "coverage_frozen": True})
                         pending_audio.clear()
 
                     # Seal only the unfinished tail: everything before the
