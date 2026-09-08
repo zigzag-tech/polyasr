@@ -409,16 +409,36 @@ def _load_diarize_model():
     return pipeline
 
 
-# polycore model units. asr is HARD_PIN — benchday needs it hot at all times; it
-# is never idle-evicted. align/diarize are demand-driven (load lazily, evict when
-# idle). The manager + residency policy (LocalCoordinator standalone, or livestack's
-# LivestackCoordinator) is wired by attach() once `app` exists, below.
+# polycore model units. asr is HARD_PIN by default — benchday needs an engine hot
+# at all times; it is never idle-evicted. align/diarize are demand-driven (load
+# lazily, evict when idle). The manager + residency policy (LocalCoordinator
+# standalone, or livestack's LivestackCoordinator) is wired by attach() once `app`
+# exists, below.
+#
+# A SECOND polyasr sharing one card is a different case, and the reason this tier
+# is a knob. Residency is per PROCESS: two nodes serving `asr` on one GPU hold two
+# copies of the weights, and two HARD_PINs are two floors neither of which Harmony
+# may ever preempt. On xc-tower-ubuntu that was 9.5 GB of un-evictable VRAM on a
+# 24 GB card sitting at 96%, for a replica serving 3 requests a day. The replica is
+# worth having for concurrency; it is not worth a permanent floor. So the PRIMARY
+# keeps the floor and a replica sets POLYASR_ASR_RESIDENCY=unpinned (or soft_pin,
+# to stay warm until the card is actually under pressure) and earns its residence.
 HOST_ID = _env("HOST_ID", "zz-tower0")
+_RESIDENCY_TIERS = {"hard_pin": ResidencyPolicy.HARD_PIN,
+                    "soft_pin": ResidencyPolicy.SOFT_PIN,
+                    "unpinned": ResidencyPolicy.UNPINNED}
+_asr_tier = _env("ASR_RESIDENCY", "hard_pin").strip().lower()
+if _asr_tier not in _RESIDENCY_TIERS:
+    # A typo must not stop this node serving, and must not silently unpin the
+    # engine benchday depends on: fall back to the safe tier and say so.
+    log.warning("POLYASR_ASR_RESIDENCY=%r is not one of %s — using hard_pin",
+                _asr_tier, ", ".join(sorted(_RESIDENCY_TIERS)))
+    _asr_tier = "hard_pin"
 _UNITS = {
     # footprint = VRAM bytes (weights + peak activation). Initial estimates from the
     # 2026-06-27 align OOM + /health; refine with livestack_node.measure_footprint().
     "asr": ManagedUnit("asr", _load_asr_model, free_cuda, footprint=5_000_000_000,
-                       residency_policy=ResidencyPolicy.HARD_PIN),
+                       residency_policy=_RESIDENCY_TIERS[_asr_tier]),
     "align": ManagedUnit("align", _load_align_model, free_cuda, footprint=3_000_000_000),
     "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda, footprint=2_500_000_000),
 }
