@@ -207,15 +207,17 @@ def load_backend(settings: dict, *, device: str, dtype: str):
     selected = settings["backend"]
     if selected == "qwen":
         from qwen_asr import Qwen3ASRModel
+        from huggingface_hub import snapshot_download
         cfg = settings["qwen"]
+        model_path = snapshot_download(repo_id=cfg["model"], revision=cfg["revision"])
         if cfg["runtime"] == "vllm":
-            model = Qwen3ASRModel.LLM(cfg["model"], dtype=dtype, max_new_tokens=512)
+            model = Qwen3ASRModel.LLM(model_path, dtype=dtype, max_new_tokens=512)
         else:
             import torch
             torch_dtype = {"bfloat16": torch.bfloat16,
                            "float16": torch.float16}.get(dtype, torch.bfloat16)
             model = Qwen3ASRModel.from_pretrained(
-                cfg["model"], dtype=torch_dtype, device_map=device,
+                model_path, dtype=torch_dtype, device_map=device,
                 max_new_tokens=512,
             )
         return QwenBackend(model, cfg["native_streaming"], cfg["chunk_seconds"])

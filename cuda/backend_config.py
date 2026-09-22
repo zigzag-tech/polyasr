@@ -17,7 +17,8 @@ log = logging.getLogger('polyasr-config')
 MAX_CONFIG_BYTES = 16384
 DEFAULTS = {
     'backend': 'qwen',
-    'qwen': {'model': 'Qwen/Qwen3-ASR-1.7B', 'runtime': 'transformers',
+    'qwen': {'model': 'Qwen/Qwen3-ASR-1.7B',
+             'revision': '7278e1e70fe206f11671096ffdd38061171dd6e5', 'runtime': 'transformers',
              'native_streaming': False, 'chunk_seconds': 2.0},
     'r2t2': {'model': 'netease-youdao/Confucius4-R2T2',
              'revision': '9479eff5c11e0868c9182c115a1b57080e1abe03',
@@ -76,11 +77,12 @@ def validate(value):
             raise ValueError(f'{key} must be a boolean')
     if out['qwen']['native_streaming'] and out['qwen']['runtime'] != 'vllm':
         raise ValueError('Qwen native streaming requires vllm')
-    revision = out['r2t2']['revision']
-    if not isinstance(revision, str) or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
-        raise ValueError('r2t2.revision must pin a 40-character commit hash')
-    if revision != DEFAULTS['r2t2']['revision']:
-        raise ValueError('r2t2.revision must use the qualified pinned revision')
+    for section in ('qwen', 'r2t2'):
+        revision = out[section]['revision']
+        if not isinstance(revision, str) or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+            raise ValueError(f'{section}.revision must pin a 40-character commit hash')
+        if revision != DEFAULTS[section]['revision']:
+            raise ValueError(f'{section}.revision must use the qualified pinned revision')
     return out
 
 

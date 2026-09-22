@@ -57,6 +57,7 @@ from runtime_preflight import validate_pytorch_stack  # noqa: E402
 from asr_backends import load_backend  # noqa: E402
 from backend_config import BackendController, DEFAULTS, context_text  # noqa: E402
 from log_storage import prune_log_storage  # noqa: E402
+from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,6 +88,7 @@ def _config_path() -> Path:
 
 
 backend_controller = BackendController(_config_path(), fallback=DEFAULTS)
+_asr_evidence = AsrEvidence()
 
 
 def _asr_settings() -> dict:
@@ -831,10 +833,19 @@ try:
         with _in_flight_lock:
             return _in_flight_count
 
+    def _inventory() -> dict:
+        cfg = _asr_settings()
+        name = backend_controller.active or cfg["backend"]
+        selected = cfg[name]
+        streaming = "native" if name == "r2t2" or selected.get("native_streaming") else "synthetic"
+        return evidence_inventory(backend=name, model=selected["model"],
+                                  model_revision=selected["revision"], streaming=streaming,
+                                  evidence=_asr_evidence)
+
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
-                                in_flight=_count)
+                                in_flight=_count, inventory=_inventory)
 except ImportError:
     from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -1033,6 +1044,8 @@ async def _transcribe_impl(file, model, language, context, response_format):
         lang = _flatten_result_language(result)
 
         elapsed = time.monotonic() - t0
+        _asr_evidence.observe("finalization_ms", elapsed * 1000)
+        _asr_evidence.observe("failure", 0)
         log.info("Transcribed in %.2fs: %s", elapsed, text[:80])
         _log_http_request(content, file.filename or "upload", text, language)
 
@@ -1052,6 +1065,7 @@ async def _transcribe_impl(file, model, language, context, response_format):
         # catch-all below would otherwise re-map it to a retryable 500.
         raise
     except Exception as e:
+        _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1512,6 +1526,8 @@ async def ws_transcribe(ws: WebSocket):
 
 async def _ws_transcribe_impl(ws: WebSocket):
     await ws.accept()
+    evidence_started = time.monotonic()
+    evidence_first_partial = False
     log.info("WebSocket client connected")
 
     # Tail-first streaming transcription.
@@ -1570,6 +1586,16 @@ async def _ws_transcribe_impl(ws: WebSocket):
     asr_context = ""
 
     async def send_json(payload: dict) -> None:
+        nonlocal evidence_first_partial
+        message_type = payload.get("type")
+        if message_type == "partial" and payload.get("text") and not evidence_first_partial:
+            _asr_evidence.observe("first_partial_ms", (time.monotonic() - evidence_started) * 1000)
+            evidence_first_partial = True
+        elif message_type == "final":
+            _asr_evidence.observe("finalization_ms", (time.monotonic() - evidence_started) * 1000)
+            _asr_evidence.observe("failure", 0)
+        elif message_type == "error":
+            _asr_evidence.observe("failure", 1)
         async with send_lock:
             await ws.send_json(payload)
 
