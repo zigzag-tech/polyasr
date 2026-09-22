@@ -1,0 +1,14 @@
+# Separate runtime: do not install into the serving Qwen venv.
+qwen-asr[vllm]==0.0.6
+confucius4-r2t2 @ git+https://github.com/netease-youdao/Confucius4-R2T2.git@80c22e6140bcb9166fb9906798894fc8b18c8309
+fastapi==0.136.0
+uvicorn==0.46.0
+python-multipart==0.0.26
+websockets==13.1
+soundfile==0.13.1
+silero-vad==6.2.1
+Resemblyzer==0.1.4
+onnxruntime-gpu==1.24.4
+setuptools==80.9.0
+pytest
+httpx

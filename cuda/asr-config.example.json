@@ -1,0 +1,24 @@
+{
+  "backend": "qwen",
+  "qwen": {
+    "model": "Qwen/Qwen3-ASR-1.7B",
+    "runtime": "transformers",
+    "native_streaming": false,
+    "chunk_seconds": 2.0
+  },
+  "r2t2": {
+    "model": "netease-youdao/Confucius4-R2T2",
+    "revision": "9479eff5c11e0868c9182c115a1b57080e1abe03",
+    "chunk_seconds": 0.16,
+    "window_seconds": 20.0,
+    "gpu_memory_utilization": 0.30,
+    "max_model_len": 4096,
+    "max_num_seqs": 1,
+    "enforce_eager": true
+  },
+  "max_context_chars": 4000,
+  "max_session_seconds": 300,
+  "max_sessions": 8,
+  "max_transcript_chars": 64000,
+  "max_upload_bytes": 67108864
+}
