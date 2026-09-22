@@ -6,6 +6,12 @@ GPUs via the official `qwen-asr` package. Lives next to the MLX server
 `packages/asr_client` treats both backends interchangeably and picks
 whichever is closer by RTT.
 
+Qwen and Confucius4-R2T2 are selected through `asr-config.json`. Copy
+`asr-config.example.json` beside `server.py`, then change only the top-level
+`backend` field between `qwen` and `r2t2`. The server observes the file and
+switches after active and resumable unfinished sessions drain. Invalid edits or
+load failures appear in `/health`; they never masquerade as a successful switch.
+
 ## Endpoints
 
 Identical to the MLX server:
@@ -39,6 +45,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now benchday-zzasr
 ```
 
+R2T2 uses its own vLLM-compatible environment so it does not replace the
+working Qwen transformers environment:
+
+```bash
+cuda/install-r2t2.sh
+cuda/venv-r2t2/bin/python cuda/server.py --config cuda/asr-config.json
+```
+
+The source package and model revision are pinned in
+`requirements-r2t2.txt` and `asr-config.example.json`. R2T2 outputs must not be
+used to train or improve another commercial AI model under the model license.
+
 First boot downloads ~4.7 GB of weights from HuggingFace into `HF_HOME`
 (default `~/.cache/huggingface`); after that, startup is ~15 s on a
 3090.
@@ -60,7 +78,6 @@ zz-tower0. Override with `ASR_PORT` in the service unit.
 
 | Var          | Default                    | Notes |
 |---|---|---|
-| `ASR_MODEL`  | `Qwen/Qwen3-ASR-1.7B`      | `Qwen/Qwen3-ASR-0.6B` works too |
 | `ASR_DEVICE` | `cuda:0`                   |  |
 | `ASR_DTYPE`  | `bfloat16`                 | or `float16` |
 | `ASR_PORT`   | `8766`                     |  |

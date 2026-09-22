@@ -54,6 +54,9 @@ from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # 
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 from runtime_preflight import validate_pytorch_stack  # noqa: E402
+from asr_backends import load_backend  # noqa: E402
+from backend_config import BackendController, DEFAULTS, context_text  # noqa: E402
+from log_storage import prune_log_storage  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,10 +77,25 @@ def _envflag(name: str, default: str) -> bool:
 
 # 1.7B is the default on this node — the RTX 3090 has enough VRAM and
 # the better-quality 1.7B weights are why we're here instead of on MLX.
-MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-1.7B")
 DEVICE = _env("DEVICE", "cuda:0")
 DTYPE = _env("DTYPE", "bfloat16")  # bfloat16 | float16
-ASR_BACKEND = _env("BACKEND", "transformers").lower()
+def _config_path() -> Path:
+    for index, value in enumerate(sys.argv[:-1]):
+        if value == "--config":
+            return Path(sys.argv[index + 1]).expanduser().resolve()
+    return Path(__file__).with_name("asr-config.json")
+
+
+backend_controller = BackendController(_config_path(), fallback=DEFAULTS)
+
+
+def _asr_settings() -> dict:
+    return backend_controller.current
+
+
+def _model_name() -> str:
+    settings = _asr_settings()
+    return settings[settings["backend"]]["model"]
 # Forced aligner (loaded lazily by /v1/align as a separate managed unit).
 ALIGNER_MODEL = _env("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 # Speaker-diarization unit (pyannote, loaded lazily by /v1/diarize). Runs on the
@@ -90,13 +108,8 @@ IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
 # benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
 # historical one-model-in-VRAM eviction behaviour.
 COLOAD = _envflag("COLOAD", "1")
-ASR_NATIVE_STREAMING = (
-    _env("NATIVE_STREAMING", "1" if ASR_BACKEND == "vllm" else "0").lower()
-    not in {"0", "false", "no"}
-)
 ASR_FINAL_WAIT_PARTIAL = _envflag("FINAL_WAIT_PARTIAL", "0")
 ASR_PARTIALS_ENABLED = _envflag("PARTIALS_ENABLED", "1")
-ASR_STREAM_CHUNK_SEC = float(_env("STREAM_CHUNK_SEC", "2.0"))
 FAKE_TRANSCRIBE = _env("FAKE_TRANSCRIBE", "").lower() in {"1", "true", "yes"}
 FAKE_TRANSCRIBE_DELAY_SEC = float(_env("FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
 _vad_model = None
@@ -224,9 +237,12 @@ class AsrProtocolSession:
     def __init__(self, session_id: str):
         now = time.monotonic()
         self.session_id = session_id
+        self.backend = _asr_settings()["backend"]
+        self.context = ""
         self.created = now
         self.updated = now
         self.chunks = {}
+        self.accepted_bytes = 0
         self.highest_contiguous_seq = -1
         self.gated_audio = bytearray()
         self.pending_audio = bytearray()
@@ -255,10 +271,22 @@ class AsrProtocolSession:
         self.stable_bytes = 0
 
     def accept(self, seq: int, payload: bytes) -> bool:
+        if time.monotonic() - self.created > _asr_settings()["max_session_seconds"]:
+            raise ValueError("ASR session exceeds configured duration limit")
+        if not isinstance(seq, int) or seq < 0:
+            raise ValueError("audio sequence must be a nonnegative integer")
+        if seq > int(_asr_settings()["max_session_seconds"] * 1000):
+            raise ValueError("audio sequence exceeds configured session limit")
+        if len(payload) > 2 * 16000 * 2:
+            raise ValueError("audio frame exceeds 2 seconds")
+        max_bytes = int(_asr_settings()["max_session_seconds"] * 16000 * 2)
+        if self.accepted_bytes + len(payload) > max_bytes:
+            raise ValueError("ASR session exceeds configured duration limit")
         self.updated = time.monotonic()
         if seq in self.chunks:
             return False
         self.chunks[seq] = payload
+        self.accepted_bytes += len(payload)
         while self.highest_contiguous_seq + 1 in self.chunks:
             self.highest_contiguous_seq += 1
         return True
@@ -312,16 +340,36 @@ _protocol_sessions = {}
 
 def _prune_protocol_sessions():
     now = time.monotonic()
+    ttl = min(ASR_RESUME_TTL_SEC, _asr_settings()["max_session_seconds"])
     stale = [
         sid for sid, sess in _protocol_sessions.items()
-        if now - sess.updated > ASR_RESUME_TTL_SEC
+        if now - sess.updated > ttl
     ]
     for sid in stale:
         _protocol_sessions.pop(sid, None)
 
 
-def _new_protocol_session(session_id: str) -> AsrProtocolSession:
+def _ensure_session_capacity() -> None:
     _prune_protocol_sessions()
+    limit = _asr_settings()["max_sessions"]
+    if len(_protocol_sessions) < limit:
+        return
+    # Empty handshakes and completed results do not own unfinalized audio. Drop
+    # the oldest of those first; live resumable audio is never silently evicted.
+    removable = sorted(
+        (session for session in _protocol_sessions.values()
+         if not session.chunks or session.final_text is not None),
+        key=lambda session: session.updated,
+    )
+    for session in removable:
+        _protocol_sessions.pop(session.session_id, None)
+        if len(_protocol_sessions) < limit:
+            return
+    raise RuntimeError("ASR resumable-session limit reached")
+
+
+def _new_protocol_session(session_id: str) -> AsrProtocolSession:
+    _ensure_session_capacity()
     sess = AsrProtocolSession(session_id)
     _protocol_sessions[session_id] = sess
     return sess
@@ -331,6 +379,7 @@ def _get_or_create_protocol_session(session_id: str) -> AsrProtocolSession:
     _prune_protocol_sessions()
     sess = _protocol_sessions.get(session_id)
     if sess is None:
+        _ensure_session_capacity()
         sess = AsrProtocolSession(session_id)
         _protocol_sessions[session_id] = sess
     return sess
@@ -358,21 +407,12 @@ def _torch_dtype():
 
 def _load_asr_model():
     """Loader for the streaming/batch ASR model (managed unit 'asr')."""
-    log.info(
-        "Loading model %s on %s (%s, backend=%s) ...",
-        MODEL_NAME, DEVICE, DTYPE, ASR_BACKEND,
-    )
-    from qwen_asr import Qwen3ASRModel
-    if ASR_BACKEND == "vllm":
-        model = Qwen3ASRModel.LLM(MODEL_NAME, dtype=DTYPE, max_new_tokens=512)
-    else:
-        import torch  # noqa: F401 — used indirectly via dtype
-        model = Qwen3ASRModel.from_pretrained(
-            MODEL_NAME,
-            dtype=_torch_dtype(),
-            device_map=DEVICE,
-            max_new_tokens=512,
-        )
+    global _loaded_backend
+    settings = _asr_settings()
+    log.info("Loading ASR model %s on %s (%s, backend=%s) ...",
+             _model_name(), DEVICE, DTYPE, settings["backend"])
+    model = load_backend(settings, device=DEVICE, dtype=DTYPE)
+    _loaded_backend = model
     log.info("ASR model loaded successfully.")
     return model
 
@@ -381,11 +421,12 @@ def _load_align_model():
     """Loader for the forced-alignment model (managed unit 'align'): an ASR
     model bundled with the forced aligner so transcribe(return_time_stamps=True)
     emits per-char timestamps."""
-    log.info("Loading aligner %s + %s on %s ...", MODEL_NAME, ALIGNER_MODEL, DEVICE)
+    qwen_model = _asr_settings()["qwen"]["model"]
+    log.info("Loading aligner %s + %s on %s ...", qwen_model, ALIGNER_MODEL, DEVICE)
     import torch
     from qwen_asr import Qwen3ASRModel
     model = Qwen3ASRModel.from_pretrained(
-        MODEL_NAME,
+        qwen_model,
         dtype=_torch_dtype(),
         device_map=DEVICE,
         # Dense Chinese narration in a 270s chunk can be ~600-1200 chars; 256
@@ -434,10 +475,23 @@ if _asr_tier not in _RESIDENCY_TIERS:
     log.warning("POLYASR_ASR_RESIDENCY=%r is not one of %s — using hard_pin",
                 _asr_tier, ", ".join(sorted(_RESIDENCY_TIERS)))
     _asr_tier = "hard_pin"
+_loaded_backend = None
+
+
+def _free_asr_backend():
+    global _loaded_backend
+    if _loaded_backend is not None:
+        try:
+            _loaded_backend.close()
+        finally:
+            _loaded_backend = None
+    free_cuda()
+
+
 _UNITS = {
     # footprint = VRAM bytes (weights + peak activation). Initial estimates from the
     # 2026-06-27 align OOM + /health; refine with livestack_node.measure_footprint().
-    "asr": ManagedUnit("asr", _load_asr_model, free_cuda, footprint=5_000_000_000,
+    "asr": ManagedUnit("asr", _load_asr_model, _free_asr_backend, footprint=8_000_000_000,
                        residency_policy=_RESIDENCY_TIERS[_asr_tier]),
     "align": ManagedUnit("align", _load_align_model, free_cuda, footprint=3_000_000_000),
     "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda, footprint=2_500_000_000),
@@ -573,7 +627,7 @@ class SessionLogger:
             self.events_file = open(self.dir / "events.jsonl", "w", encoding="utf-8")
             self.enabled = True
             self.event("start", {"session_id": self.session_id, "kind": kind,
-                                 "model": MODEL_NAME, "backend": "cuda"})
+                                 "model": _model_name(), "backend": "cuda"})
         except Exception:
             log.exception("SessionLogger init failed; logging disabled for this session")
             self.enabled = False
@@ -632,6 +686,10 @@ class SessionLogger:
                 pcm_path.unlink()  # empty file — drop it
         except Exception:
             log.exception("FLAC transcode failed; keeping .pcm")
+        try:
+            prune_log_storage(LOG_DIR)
+        except Exception:
+            log.exception("polyASR log retention failed")
 
 
 def _log_http_request(audio_bytes: bytes, filename: str, text: str,
@@ -650,11 +708,12 @@ def _log_http_request(audio_bytes: bytes, filename: str, text: str,
         meta = {"timestamp": now.isoformat(timespec="seconds"),
                 "filename": filename,
                 "language": language,
-                "model": MODEL_NAME,
+                "model": _model_name(),
                 "backend": "cuda",
                 "text": text}
         (prefix.with_suffix(".json")).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        prune_log_storage(LOG_DIR)
     except Exception:
         log.exception("HTTP request logging failed")
 
@@ -680,27 +739,17 @@ def rms_energy(pcm_data: bytes) -> float:
 
 
 def native_streaming_available() -> bool:
-    if not ASR_NATIVE_STREAMING or FAKE_TRANSCRIBE:
+    if FAKE_TRANSCRIBE:
         return False
     with _transcribe_lock:
         session = get_session()
-    return all(
-        hasattr(session, name)
-        for name in (
-            "init_streaming_state",
-            "streaming_transcribe",
-            "finish_streaming_transcribe",
-        )
-    ) and getattr(session, "backend", None) == "vllm"
+    return bool(getattr(session, "native_streaming", False))
 
 
 def init_native_stream(context: str):
     with _transcribe_lock:
         session = get_session()
-    return session.init_streaming_state(
-        context=context or "",
-        chunk_size_sec=ASR_STREAM_CHUNK_SEC,
-    )
+    return session.init_stream(context)
 
 
 async def feed_native_stream(state, pcm_data: bytes) -> str:
@@ -713,10 +762,9 @@ async def feed_native_stream(state, pcm_data: bytes) -> str:
 
     def run_feed():
         with _transcribe_lock:
-            return get_session().streaming_transcribe(pcm, state)
+            return get_session().feed_stream(state, pcm)
 
-    await loop.run_in_executor(None, run_feed)
-    return (getattr(state, "text", "") or "").strip()
+    return (await loop.run_in_executor(None, run_feed) or "").strip()
 
 
 async def finish_native_stream(state) -> str:
@@ -726,10 +774,9 @@ async def finish_native_stream(state) -> str:
 
     def run_finish():
         with _transcribe_lock:
-            return get_session().finish_streaming_transcribe(state)
+            return get_session().finish_stream(state)
 
-    await loop.run_in_executor(None, run_finish)
-    return (getattr(state, "text", "") or "").strip()
+    return (await loop.run_in_executor(None, run_finish) or "").strip()
 
 
 def _flatten_result_text(result) -> str:
@@ -813,9 +860,39 @@ async def _idle_evict_loop():
             log.exception("idle-evict sweep failed")
 
 
+def _has_unfinished_sessions() -> bool:
+    _prune_protocol_sessions()
+    return any(session.final_text is None for session in _protocol_sessions.values())
+
+
+def _activate_configured_backend() -> None:
+    if FAKE_TRANSCRIBE:
+        return
+    with _transcribe_lock:
+        try:
+            manager.recover("asr")
+        except AttributeError as exc:
+            # Older LivestackCoordinator deployments predate the optional
+            # degradation notification. ModelManager raises only after its
+            # reload has succeeded; verify that exact state before accepting it.
+            expected = _asr_settings()["backend"]
+            if ("on_degraded" not in str(exc)
+                    or _loaded_backend is None
+                    or _loaded_backend.name != expected
+                    or not _UNITS["asr"].loaded):
+                raise
+            log.warning("ASR reload succeeded; coordinator has no on_degraded hook")
+
+
+async def _backend_config_loop() -> None:
+    await backend_controller.watch(_has_unfinished_sessions, _activate_configured_backend)
+
+
 @app.on_event("startup")
 async def startup_event():
     if FAKE_TRANSCRIBE:
+        backend_controller.active = _asr_settings()["backend"]
+        asyncio.create_task(_backend_config_loop())
         log.info("POLYASR_FAKE_TRANSCRIBE enabled; skipping model/VAD/encoder preload.")
         return
     versions = validate_pytorch_stack()
@@ -824,11 +901,27 @@ async def startup_event():
     # gigabytes for Qwen. A broken VAD/encoder must fail cheap.
     get_vad()
     get_encoder()
+    if LOG_DIR is not None:
+        prune_log_storage(LOG_DIR)
     log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
     with _transcribe_lock:
         get_session()
+    backend_controller.active = _asr_settings()["backend"]
     asyncio.create_task(_idle_evict_loop())
+    asyncio.create_task(_backend_config_loop())
     log.info("Server ready.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if manager is None:
+        return
+    loop = asyncio.get_event_loop()
+    def unload():
+        with _transcribe_lock:
+            return manager.unload_now()
+    await loop.run_in_executor(None, unload)
+    log.info("Server shutdown released managed model executors.")
 
 
 @app.get("/health")
@@ -845,9 +938,13 @@ async def health():
             }
     except Exception:
         pass
-    return {"status": "ok", "model": MODEL_NAME, "backend": "cuda",
-            "dtype": DTYPE, "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
+    backend = backend_controller.status()
+    body = {"status": "error" if backend["error"] else "ok",
+            "model": _model_name(), "backend": "cuda",
+            "asr_backend": backend, "dtype": DTYPE,
+            "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
             "manager": manager.status()}
+    return JSONResponse(body, status_code=503 if backend["error"] else 200)
 
 
 @app.post("/model/unload")
@@ -855,6 +952,8 @@ async def model_unload():
     """Force-evict the resident model from VRAM (and return freed heap to the
     OS) without stopping the server, so a co-resident workload can reclaim the
     GPU. The model reloads lazily on the next transcribe/align."""
+    if backend_controller.requests or _has_unfinished_sessions():
+        raise HTTPException(status_code=409, detail="ASR recognition has not drained")
     loop = asyncio.get_event_loop()
 
     def do_unload():
@@ -876,18 +975,29 @@ async def transcribe(
     context: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
 ):
-    with _in_flight():
-        return await _transcribe_impl(file, model, language, context, response_format)
+    try:
+        async with backend_controller.request():
+            with _in_flight():
+                return await _transcribe_impl(file, model, language, context, response_format)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 async def _transcribe_impl(file, model, language, context, response_format):
     t0 = time.monotonic()
+    try:
+        context = context_text(context, _asr_settings())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        content = await file.read()
+        upload_limit = _asr_settings()["max_upload_bytes"]
+        content = await file.read(upload_limit + 1)
         if not content:
             raise HTTPException(status_code=422, detail="empty upload: no audio bytes")
+        if len(content) > upload_limit:
+            raise HTTPException(status_code=413, detail="audio upload exceeds configured byte limit")
         tmp.write(content)
         tmp.flush()
         tmp.close()
@@ -1012,7 +1122,7 @@ def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int
     }
 
 
-_ALIGN_MODEL_LABEL = f"{MODEL_NAME} + {ALIGNER_MODEL}"
+_ALIGN_MODEL_LABEL = f"{DEFAULTS['qwen']['model']} + {ALIGNER_MODEL}"
 
 
 def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
@@ -1390,8 +1500,14 @@ def _process_staged_audio(staging, prev_window, gate_state):
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
-    with _in_flight():
-        await _ws_transcribe_impl(ws)
+    try:
+        async with backend_controller.request():
+            with _in_flight():
+                await _ws_transcribe_impl(ws)
+    except RuntimeError as exc:
+        await ws.accept()
+        await ws.send_json({"type": "error", "error": str(exc)})
+        await ws.close(code=1013)
 
 
 async def _ws_transcribe_impl(ws: WebSocket):
@@ -2024,13 +2140,36 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         else _get_or_create_protocol_session(protocol_session_id)
                     )
                     hydrate_from_protocol_session(protocol_session)
-                    asr_context = msg.get("context") or ""
+                    try:
+                        requested_context = (
+                            protocol_session.context
+                            if msg_type == "resume" and "context" not in msg
+                            else context_text(msg.get("context"), _asr_settings())
+                        )
+                    except ValueError as exc:
+                        await send_json({"type": "error", "error": str(exc)})
+                        break
+                    if msg_type == "resume" and protocol_session.context != requested_context:
+                        await send_json({
+                            "type": "error",
+                            "error": "resume context does not match the original session",
+                        })
+                        break
+                    if msg_type == "start":
+                        protocol_session.context = requested_context
+                    asr_context = protocol_session.context
+                    if protocol_session.backend != _asr_settings()["backend"]:
+                        await send_json({
+                            "type": "error",
+                            "error": "session backend is no longer active",
+                        })
+                        break
                     if native_streaming_available() and native_stream_state is None:
                         native_stream_state = init_native_stream(asr_context)
                         sync_protocol_session()
                         slog.event("native_stream_started", {
-                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
-                            "backend": ASR_BACKEND,
+                            "chunk_sec": _asr_settings()[_asr_settings()["backend"]]["chunk_seconds"],
+                            "backend": _asr_settings()["backend"],
                         })
                     slog.event("protocol_started", {
                         "session_id": protocol_session_id,
