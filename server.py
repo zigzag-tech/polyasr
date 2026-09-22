@@ -46,6 +46,7 @@ from livestack_node import (ModelManager as AsrModelManager, ManagedUnit, Reside
                       counting, free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
+from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
 
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 
@@ -67,6 +68,8 @@ def _envflag(name: str, default: str) -> bool:
 
 
 MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-0.6B")
+MODEL_REVISION = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+_asr_evidence = AsrEvidence()
 # MLX forced-alignment models (loaded lazily by /v1/align). The aligner needs an
 # ASR model + a separate forced-aligner model, both via mlx_audio.stt.
 ALIGN_ASR_MODEL = _env("ALIGN_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-4bit")
@@ -851,10 +854,15 @@ try:
     # own — no LIVESTACK_PEERS entry, no broker restart. It is the one fact the
     # broker cannot infer (a POST shows it our source address, not what we
     # listen on), and it is the same value we hand uvicorn at the bottom.
+    def _inventory() -> dict:
+        return evidence_inventory(backend="qwen-mlx", model=MODEL_NAME,
+                                  model_revision=MODEL_REVISION, streaming="synthetic",
+                                  evidence=_asr_evidence)
+
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
-                                in_flight=_busy)
+                                in_flight=_busy, inventory=_inventory)
     log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
 except ImportError:
     manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -1051,6 +1059,8 @@ async def transcribe(
         _clear_mlx_cache()
 
         elapsed = time.monotonic() - t0
+        _asr_evidence.observe("finalization_ms", elapsed * 1000)
+        _asr_evidence.observe("failure", 0)
         log.info("Transcribed in %.2fs: %s", elapsed, result.text[:80])
         _log_http_request(content, file.filename or "upload",
                           result.text, language)
@@ -1067,6 +1077,7 @@ async def transcribe(
         else:
             return JSONResponse({"text": result.text})
     except ModelUnavailable as e:
+        _asr_evidence.observe("failure", 1)
         # 503, not 500: the node cannot serve at all (weights gone / unloadable),
         # so callers should route to another node rather than retry here.
         log.critical("ASR model unavailable (batch): %s", e)
@@ -1076,6 +1087,7 @@ async def transcribe(
         # catch-all below would otherwise re-map it to a retryable 500.
         raise
     except Exception as e:
+        _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1571,6 +1583,8 @@ def _join_text(prefix: str, suffix: str) -> str:
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
     await ws.accept()
+    evidence_started = time.monotonic()
+    evidence_first_partial = False
     log.info("WebSocket client connected")
 
     # Tail-first streaming transcription.
@@ -1630,6 +1644,16 @@ async def ws_transcribe(ws: WebSocket):
     asr_context = ""
 
     async def send_json(payload: dict) -> None:
+        nonlocal evidence_first_partial
+        message_type = payload.get("type")
+        if message_type == "partial" and payload.get("text") and not evidence_first_partial:
+            _asr_evidence.observe("first_partial_ms", (time.monotonic() - evidence_started) * 1000)
+            evidence_first_partial = True
+        elif message_type == "final":
+            _asr_evidence.observe("finalization_ms", (time.monotonic() - evidence_started) * 1000)
+            _asr_evidence.observe("failure", 0)
+        elif message_type == "error":
+            _asr_evidence.observe("failure", 1)
         async with send_lock:
             await ws.send_json(payload)
 
