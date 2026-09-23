@@ -12,6 +12,7 @@ class Decoder:
         self.finals = iter(finals)
         self.contexts = []
         self.finish_buffer_sizes = []
+        self.finish_budgets = []
 
     def init_streaming_state(self, **kwargs):
         self.contexts.append(kwargs["context"])
@@ -28,6 +29,7 @@ class Decoder:
 
     def finish_streaming_transcribe(self, state, max_new_tokens=None):
         self.finish_buffer_sizes.append(state.buffer.size)
+        self.finish_budgets.append(max_new_tokens)
         state.text = next(self.finals)
         state.buffer = np.zeros(0, dtype=np.float32)
         return state.text
@@ -86,3 +88,34 @@ def test_partial_shows_trailing_words_the_revision_guard_holds_back():
         "fix the stop path now"
     assert stream.committed_text == "fix the"
     assert backend.finish_stream(stream) == "fix the stop path now please"
+
+
+def test_stop_decodes_even_when_the_chunk_buffer_is_empty():
+    # Upstream returns its last streaming text without decoding when nothing is
+    # buffered. That text came from a step budget as small as 2 tokens, so a
+    # decoder running behind fast speech would hand back a short final.
+    decoder = Decoder(feeds=[("ok so", "ok")], finals=["ok so fix it now"])
+    backend = R2T2Backend(decoder, chunk_seconds=.16, window_seconds=20,
+                          max_transcript_chars=100)
+    stream = backend.init_stream("")
+    backend.feed_stream(stream, np.full(2560, .1, dtype=np.float32))
+    stream.state.buffer = np.zeros(0, dtype=np.float32)  # chunk fully consumed
+
+    assert backend.finish_stream(stream) == "ok so fix it now"
+    assert decoder.finish_buffer_sizes[-1] > 0
+    assert decoder.finish_budgets[-1] >= 64
+
+
+def test_window_resets_at_a_pause_not_mid_word():
+    decoder = Decoder(
+        feeds=[("one two three", "one two three"), ("", "")],
+        finals=["one two three.", "four"],
+    )
+    backend = R2T2Backend(decoder, chunk_seconds=.16, window_seconds=2,
+                          max_transcript_chars=100)
+    stream = backend.init_stream("")
+    backend.feed_stream(stream, np.full(26000, .1, dtype=np.float32))  # speech
+    assert len(decoder.contexts) == 1, "no reset while the speaker is talking"
+    backend.feed_stream(stream, np.zeros(5000, dtype=np.float32))  # a pause
+    assert len(decoder.contexts) == 2, "the pause past 75% of the window seals"
+    assert stream.committed_text == "one two three."
