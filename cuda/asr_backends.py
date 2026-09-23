@@ -68,8 +68,10 @@ class R2T2Stream:
     window_samples: int
     base_text: str = ""
     committed_text: str = ""
-    # What a partial shows: the decoder's own fixed text, which runs ahead of
-    # committed_text by the _stable_prefix guard. The guard exists so that
+    # What a partial shows: the decoder's full current text, which runs ahead
+    # of committed_text by the _stable_prefix guard AND of the decoder's own
+    # fixed text by its unfixed token (unfixed_token_num=1) -- after the speaker
+    # stops, that token was the last word, held back until the final. The guard exists so that
     # _require_prefix can hold committed text to a no-revision contract; a
     # partial is display-only (the client never promotes one), so holding the
     # guard's last three words back from the SCREEN bought nothing and cost the
@@ -186,7 +188,7 @@ class R2T2Backend:
             room = stream.window_samples - stream.samples_in_window
             take = min(room, samples.size - cursor)
             previous = stream.committed_text
-            _, fixed = self.model.streaming_transcribe(
+            full, fixed = self.model.streaming_transcribe(
                 samples[cursor:cursor + take], stream.state,
                 max_new_tokens=stream.max_new_tokens,
             )
@@ -202,9 +204,18 @@ class R2T2Backend:
                 stable = _stable_prefix(candidate)
                 if stable.startswith(stream.committed_text):
                     stream.committed_text = stable
-                stream.display_text = candidate
                 if len(stream.committed_text) > self.max_transcript_chars:
                     raise ValueError("ASR transcript exceeds configured character limit")
+            shown = candidate if fixed else ""
+            if full:
+                with_unfixed = _join(stream.base_text, full)
+                # The unfixed token may revise the fixed tail (punctuation);
+                # then it does not extend committed text and the fixed text
+                # is what we can show.
+                if with_unfixed.startswith(stream.committed_text):
+                    shown = with_unfixed
+            if shown:
+                stream.display_text = shown
             if stream.first_decode and getattr(stream.state, "chunk_id", 0) > 0:
                 stream.first_decode = False
                 stream.state.chunk_size_sec = self.chunk_seconds

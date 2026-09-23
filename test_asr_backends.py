@@ -84,8 +84,10 @@ def test_partial_shows_trailing_words_the_revision_guard_holds_back():
                           max_transcript_chars=100)
     stream = backend.init_stream("")
 
+    # Includes the decoder's unfixed last token ("please"): once the speaker
+    # stops, that token IS the last word.
     assert backend.feed_stream(stream, np.zeros(100, dtype=np.float32)) == \
-        "fix the stop path now"
+        "fix the stop path now please"
     assert stream.committed_text == "fix the"
     assert backend.finish_stream(stream) == "fix the stop path now please"
 
