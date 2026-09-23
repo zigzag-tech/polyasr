@@ -1579,6 +1579,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
     last_signal_time = time.monotonic()
     native_stream_state = None
     partial_task = None
+    # The last incremental partial's decode: (stable_bytes, audio, text). When
+    # stop's tail is byte-identical, that decode IS the tail decode.
+    partial_decode = None
     closing = False
     loop = asyncio.get_event_loop()
     slog = SessionLogger("ws")
@@ -1887,11 +1890,25 @@ async def _ws_transcribe_impl(ws: WebSocket):
 
                 pending_audio.clear()
 
-    def partial_snapshot() -> bytes:
+    def partial_snapshot():
+        """Audio for the next partial, and the stable prefix it continues.
+
+        Incremental when it can be: the stable prefix is already decoded, so a
+        partial decodes only the accepted speech after it — the same bytes stop
+        will decode — and shows prefix + tail. The text then always runs from
+        the start of the utterance. The 20 s sliding window re-transcribed its
+        overlap differently each time ("QW. QW E and ASR" vs "QWEN ASR"), which
+        the client could not reconcile, so long dictations showed sentences
+        repeated in the draft. The window remains the fallback for a tail too
+        long to decode per partial (stable commits kept coming back empty).
+        """
+        tail = bytes(gated_audio[stable_bytes:]) + bytes(pending_audio)
+        if len(tail) <= PARTIAL_WINDOW_BYTES:
+            return tail, stable_bytes, stable_text
         buf = raw_partial_audio if raw_partial_audio else partial_audio
         if len(buf) > PARTIAL_WINDOW_BYTES:
-            return bytes(buf[-PARTIAL_WINDOW_BYTES:])
-        return bytes(buf)
+            return bytes(buf[-PARTIAL_WINDOW_BYTES:]), None, ""
+        return bytes(buf), None, ""
 
     async def transcribe_partial(buf: bytes) -> str:
         """Transcribe the last N seconds of audio for live partials.
@@ -1905,8 +1922,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
         ).strip()
         return text
 
-    async def run_partial(buf: bytes, signal_snapshot: int) -> None:
-        nonlocal last_partial_time, last_partial_text
+    async def run_partial(buf: bytes, signal_snapshot: int,
+                          prefix_bytes=None, prefix_text: str = "") -> None:
+        nonlocal last_partial_time, last_partial_text, partial_decode
         nonlocal raw_signal_bytes_at_last_partial
         audio_sec = len(buf) / BYTES_PER_SEC
         slog.event("partial_begin", {
@@ -1915,6 +1933,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
         })
         try:
             text = await transcribe_partial(buf)
+            if prefix_bytes is not None:
+                partial_decode = (prefix_bytes, buf, text)
+                text = join_transcript(prefix_text, text)
             if closing:
                 slog.event("partial_suppressed", {"reason": "closing"})
                 return
@@ -2025,12 +2046,28 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 await commit_task
             except Exception:
                 log.exception("Stable prefix commit failed before final")
+        if partial_task is not None and not partial_task.done():
+            # It holds the model lock, so the tail decode would wait for it
+            # anyway — and it may have decoded exactly the tail.
+            try:
+                await partial_task
+            except Exception:
+                log.exception("Partial transcription failed before final")
         tail = bytes(gated_audio[stable_bytes:])
         tail_text = ""
+        reused = (
+            partial_decode is not None
+            and partial_decode[0] == stable_bytes
+            and partial_decode[1] == tail
+        )
         # No length floor: the tail is the end of the utterance and a floor here
         # silently drops a short last word. The decoder is the judge of whether
         # there are words in it.
-        if tail:
+        if reused:
+            # Same bytes, same context, same model: the partial's decode is the
+            # tail decode, so the final covers exactly what it would have.
+            tail_text = partial_decode[2]
+        elif tail:
             tail_text = (
                 await _transcribe_buffer(bytearray(tail), context=asr_context)
                 or ""
@@ -2041,6 +2078,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 "stable_sec": stable_bytes / BYTES_PER_SEC,
                 "tail_sec": len(tail) / BYTES_PER_SEC,
                 "reused_stable": bool(stable_text),
+                "reused_partial_decode": reused,
             })
             return final_text, recognized_frontier()
         # Short commands can fall below the VAD commit threshold, leaving
@@ -2075,12 +2113,13 @@ async def _ws_transcribe_impl(ws: WebSocket):
                            now - last_signal_time):
             return
 
-        buf = partial_snapshot()
+        buf, prefix_bytes, prefix_text = partial_snapshot()
         if len(buf) < int(BYTES_PER_SEC * 0.3):
             return
 
         signal_snapshot = raw_signal_bytes
-        partial_task = asyncio.create_task(run_partial(buf, signal_snapshot))
+        partial_task = asyncio.create_task(
+            run_partial(buf, signal_snapshot, prefix_bytes, prefix_text))
         partial_task.add_done_callback(observe_partial_task)
 
     try:
