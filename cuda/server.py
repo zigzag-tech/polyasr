@@ -170,8 +170,11 @@ VAD_THRESHOLD = 0.5
 # on very short clips are unstable.
 MIN_EMBED_SEC = 1.0
 MIN_EMBED_BYTES_CONST = int(MIN_EMBED_SEC * 16000 * 2)
-# Cosine similarity threshold for "same speaker as reference".
-SPEAKER_SIM_THRESHOLD = 0.70
+# Cosine similarity threshold for "same speaker as reference". Was 0.70, which
+# rejected the account owner's own voice: over 7 days (2026-09-16..23) every
+# rejected score sat between 0.59 and 0.70 — 69 rejects, 259 s of speech — and
+# each one froze coverage and sent the dictation to a full batch re-upload.
+SPEAKER_SIM_THRESHOLD = float(_env("SPEAKER_SIM_THRESHOLD", "0.50"))
 ASR_PROTOCOL_VERSION = 1
 ASR_FRAME_MAGIC = b"BASR"
 ASR_FRAME_HEADER_BYTES = 16
@@ -662,9 +665,11 @@ class SessionLogger:
         """Close handles and transcode PCM → FLAC. Safe to call once."""
         if not self.enabled:
             return
-        self.enabled = False
+        # Logged BEFORE disabling: event() is a no-op once disabled, so the
+        # other order never wrote `close` or the session's duration.
         self.event("close", {"audio_bytes": self.bytes_written,
                              "duration_ms": self._ms()})
+        self.enabled = False
         try:
             if self.pcm_file:
                 self.pcm_file.close()
