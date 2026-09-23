@@ -54,6 +54,13 @@ class R2T2Stream:
     window_samples: int
     base_text: str = ""
     committed_text: str = ""
+    # What a partial shows: the decoder's own fixed text, which runs ahead of
+    # committed_text by the _stable_prefix guard. The guard exists so that
+    # _require_prefix can hold committed text to a no-revision contract; a
+    # partial is display-only (the client never promotes one), so holding the
+    # guard's last three words back from the SCREEN bought nothing and cost the
+    # trailing words of every utterance until the final arrived.
+    display_text: str = ""
     samples_in_window: int = 0
     finished: bool = False
     first_decode: bool = True
@@ -123,6 +130,7 @@ class R2T2Backend:
     def _publish(self, stream: R2T2Stream, local_text: str) -> str:
         candidate = _join(stream.base_text, local_text)
         stream.committed_text = _require_prefix(stream.committed_text, candidate)
+        stream.display_text = stream.committed_text
         if len(stream.committed_text) > self.max_transcript_chars:
             raise ValueError("ASR transcript exceeds configured character limit")
         return stream.committed_text
@@ -159,6 +167,7 @@ class R2T2Backend:
                 stable = _stable_prefix(candidate)
                 if stable.startswith(stream.committed_text):
                     stream.committed_text = stable
+                stream.display_text = candidate
                 if len(stream.committed_text) > self.max_transcript_chars:
                     raise ValueError("ASR transcript exceeds configured character limit")
             if stream.first_decode and getattr(stream.state, "chunk_id", 0) > 0:
@@ -175,7 +184,7 @@ class R2T2Backend:
                 stream.max_new_tokens = min(32, stream.max_new_tokens + 1)
             if stream.samples_in_window == stream.window_samples:
                 self._seal_window(stream)
-        return stream.committed_text
+        return stream.display_text or stream.committed_text
 
     def finish_stream(self, stream: R2T2Stream) -> str:
         if stream.finished:

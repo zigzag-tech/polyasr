@@ -25,6 +25,7 @@ import json
 import os
 import struct
 import sys
+import time
 
 import pytest
 
@@ -459,6 +460,43 @@ def test_short_trailing_clause_reaches_the_decoder(client, decoder):
     )
     assert final["recognizedThroughSeq"] == seq, (
         "the clause was decoded, so the final covers everything captured"
+    )
+
+
+def test_trailing_words_get_a_partial_once_the_speaker_goes_quiet(client, decoder):
+    """Speech worth less than PARTIAL_MIN_DELTA_SEC, then silence.
+
+    The minimum only advances on NEW sound, so a remainder this small followed
+    by silence never earned a partial: the last words of an utterance stayed off
+    screen until the final. Silence now releases it.
+    """
+    trailing = 0.4
+    assert trailing < server.PARTIAL_MIN_DELTA_SEC
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-trailing-partial")
+        seq = send_speech(ws, trailing, 0)
+        # Real time, not just silent bytes: the release is "the speaker has
+        # been quiet for PARTIAL_TRAILING_IDLE_SEC", and the phone streams
+        # silence frames at wall-clock pace.
+        for _ in range(int(server.PARTIAL_TRAILING_IDLE_SEC / 0.05) + 6):
+            seq = send_silence(ws, 0.1, seq)
+            time.sleep(0.05)
+        ws.send_text(json.dumps({
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-trailing-partial",
+            "stopId": "sess-trailing-partial-stop-1",
+            "finalCapturedSeq": seq,
+        }))
+        seen = []
+        for _ in range(400):
+            msg = json.loads(ws.receive_text())
+            seen.append(msg.get("type"))
+            if msg.get("type") == "final":
+                break
+
+    assert "partial" in seen[:seen.index("final")], (
+        "the trailing words never reached the screen before stop"
     )
 
 

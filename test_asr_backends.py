@@ -68,3 +68,21 @@ def test_transcript_bound_is_explicit():
     stream = backend.init_stream("")
     with pytest.raises(ValueError, match="character limit"):
         backend.feed_stream(stream, np.zeros(100, dtype=np.float32))
+
+
+def test_partial_shows_trailing_words_the_revision_guard_holds_back():
+    # The guard keeps the last three words out of committed_text so the
+    # no-revision contract has slack; the partial must still show them, or the
+    # end of every utterance is invisible until the final.
+    decoder = Decoder(
+        feeds=[("fix the stop path now please", "fix the stop path now")],
+        finals=["fix the stop path now please"],
+    )
+    backend = R2T2Backend(decoder, chunk_seconds=.16, window_seconds=20,
+                          max_transcript_chars=100)
+    stream = backend.init_stream("")
+
+    assert backend.feed_stream(stream, np.zeros(100, dtype=np.float32)) == \
+        "fix the stop path now"
+    assert stream.committed_text == "fix the"
+    assert backend.finish_stream(stream) == "fix the stop path now please"
