@@ -8,6 +8,20 @@ from typing import Any
 import numpy as np
 
 SAMPLE_RATE = 16000
+# A seal (window reset or stop) decodes whatever the streaming steps have not
+# emitted yet. Per-step budgets are as small as 2 tokens, so after fast speech
+# the decoder can be several words behind; the seal must be able to catch up.
+# Generation stops at end-of-sequence, so the budget costs nothing unused.
+SEAL_MAX_NEW_TOKENS = 128
+# Upstream finish_streaming_transcribe() returns its last text WITHOUT decoding
+# when its buffer is empty (about half of all stops with 80 ms frames and
+# 160 ms chunks). Handing it this much silence makes it always decode.
+SEAL_PAD_SAMPLES = SAMPLE_RATE // 100
+# Reset the context window at a pause rather than at an arbitrary sample: a
+# fresh decoder state mid-word produced "two 6" for "two weeks" at the 20 s mark.
+# Once this fraction of the window is used, a quiet run of SEAL_QUIET_SEC seals.
+SEAL_EARLY_FRACTION = 0.75
+SEAL_QUIET_SEC = 0.3
 
 
 def _join(prefix: str, suffix: str) -> str:
@@ -65,6 +79,15 @@ class R2T2Stream:
     finished: bool = False
     first_decode: bool = True
     max_new_tokens: int = 4
+    quiet_samples: int = 0
+
+
+def _is_quiet(samples: np.ndarray) -> bool:
+    """The server's pcm_has_signal() bar, on float32 samples."""
+    if samples.size == 0:
+        return True
+    magnitude = np.abs(samples)
+    return float(magnitude.mean()) < 80 / 32768 and float(magnitude.max()) < 900 / 32768
 
 
 class QwenBackend:
@@ -135,16 +158,24 @@ class R2T2Backend:
             raise ValueError("ASR transcript exceeds configured character limit")
         return stream.committed_text
 
-    def _seal_window(self, stream: R2T2Stream) -> None:
+    def _seal(self, stream: R2T2Stream) -> str:
+        """Decode everything not yet emitted, always, with room to catch up."""
+        buffer = getattr(stream.state, "buffer", None)
+        if buffer is None or np.asarray(buffer).size == 0:
+            stream.state.buffer = np.zeros(SEAL_PAD_SAMPLES, dtype=np.float32)
         final_local = self.model.finish_streaming_transcribe(
-            stream.state, max_new_tokens=max(4, stream.max_new_tokens)
+            stream.state, max_new_tokens=SEAL_MAX_NEW_TOKENS
         )
-        self._publish(stream, final_local)
+        return self._publish(stream, final_local)
+
+    def _seal_window(self, stream: R2T2Stream) -> None:
+        self._seal(stream)
         stream.base_text = stream.committed_text
         stream.state = self._new_state(stream.context)
         stream.samples_in_window = 0
         stream.first_decode = True
         stream.max_new_tokens = 4
+        stream.quiet_samples = 0
 
     def feed_stream(self, stream: R2T2Stream, pcm: np.ndarray) -> str:
         if stream.finished:
@@ -159,6 +190,10 @@ class R2T2Backend:
                 samples[cursor:cursor + take], stream.state,
                 max_new_tokens=stream.max_new_tokens,
             )
+            if _is_quiet(samples[cursor:cursor + take]):
+                stream.quiet_samples += take
+            else:
+                stream.quiet_samples = 0
             stream.samples_in_window += take
             cursor += take
             if fixed:
@@ -182,17 +217,18 @@ class R2T2Backend:
                 )
             else:
                 stream.max_new_tokens = min(32, stream.max_new_tokens + 1)
-            if stream.samples_in_window == stream.window_samples:
+            if stream.samples_in_window == stream.window_samples or (
+                stream.samples_in_window
+                >= SEAL_EARLY_FRACTION * stream.window_samples
+                and stream.quiet_samples >= SEAL_QUIET_SEC * SAMPLE_RATE
+            ):
                 self._seal_window(stream)
         return stream.display_text or stream.committed_text
 
     def finish_stream(self, stream: R2T2Stream) -> str:
         if stream.finished:
             return stream.committed_text
-        final_local = self.model.finish_streaming_transcribe(
-            stream.state, max_new_tokens=max(4, stream.max_new_tokens)
-        )
-        result = self._publish(stream, final_local)
+        result = self._seal(stream)
         stream.finished = True
         return result
 

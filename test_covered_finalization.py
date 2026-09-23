@@ -500,6 +500,65 @@ def test_trailing_words_get_a_partial_once_the_speaker_goes_quiet(client, decode
     )
 
 
+def test_stop_reuses_a_partial_that_decoded_exactly_the_tail(client, decoder):
+    """Pause, then stop: the trailing partial already decoded the tail.
+
+    The model lock made stop wait for that partial and then decode the same
+    bytes again — 2-3.5 s per flush on the Mac.
+    """
+    spy = decoder
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-reuse")
+        seq = send_speech(ws, 1.0, 0)
+        for _ in range(int(server.PARTIAL_TRAILING_IDLE_SEC / 0.05) + 6):
+            seq = send_silence(ws, 0.1, seq)
+            time.sleep(0.05)
+        partial = drain_until(ws, "partial")
+        at_stop = spy.mark()
+        ws.send_text(json.dumps({
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-reuse",
+            "stopId": "sess-reuse-stop-1",
+            "finalCapturedSeq": seq,
+        }))
+        final = drain_until(ws, "final")
+
+    assert spy.calls[at_stop:] == [], "stop decoded the tail a second time"
+    assert final["text"] == partial["partial"]
+    assert final["recognizedThroughSeq"] == seq
+
+
+def test_partials_decode_the_tail_not_a_sliding_window(client, decoder):
+    """Once a stable prefix exists, a partial decodes only what follows it.
+
+    Re-decoding the last 20 s each time is what made long dictations repeat
+    sentences in the draft (the overlap came back worded differently).
+    """
+    spy = decoder
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-incremental")
+        seq = 0
+        for _ in range(8):  # 32 s: 3 s speech + 1 s silence, repeated
+            seq = send_speech(ws, 3.0, seq)
+            seq = send_silence(ws, 1.0, seq)
+            time.sleep(0.1)
+        ws.send_text(json.dumps({
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-incremental",
+            "stopId": "sess-incremental-stop-1",
+            "finalCapturedSeq": seq,
+        }))
+        drain_until(ws, "final")
+
+    assert spy.calls, "nothing was decoded"
+    assert spy.max_seconds <= server.STABLE_COMMIT_MAX_BYTES / BYTES_PER_SEC + 1, (
+        f"a decode of {spy.max_seconds:.1f}s: partials are still re-reading a "
+        "sliding window instead of the tail after the stable prefix"
+    )
+
+
 def test_a_discarded_span_cannot_report_full_coverage(client, monkeypatch):
     """A speaker-rejected chunk must cost the coverage claim, not the words.
 
