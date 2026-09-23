@@ -463,13 +463,16 @@ def test_short_trailing_clause_reaches_the_decoder(client, decoder):
     )
 
 
-def test_trailing_words_get_a_partial_once_the_speaker_goes_quiet(client, decoder):
+def test_trailing_words_get_a_partial_once_the_speaker_goes_quiet(client, decoder, monkeypatch):
     """Speech worth less than PARTIAL_MIN_DELTA_SEC, then silence.
 
     The minimum only advances on NEW sound, so a remainder this small followed
     by silence never earned a partial: the last words of an utterance stayed off
     screen until the final. Silence now releases it.
     """
+    # The MLX build ships with partials OFF by default (production turns them
+    # on in the launchd plist); without this the test would wait on nothing.
+    monkeypatch.setattr(server, "ASR_PARTIALS_ENABLED", True)
     trailing = 0.4
     assert trailing < server.PARTIAL_MIN_DELTA_SEC
     with client.websocket_connect("/ws/transcribe") as ws:
@@ -500,13 +503,14 @@ def test_trailing_words_get_a_partial_once_the_speaker_goes_quiet(client, decode
     )
 
 
-def test_stop_reuses_a_partial_that_decoded_exactly_the_tail(client, decoder):
+def test_stop_reuses_a_partial_that_decoded_exactly_the_tail(client, decoder, monkeypatch):
     """Pause, then stop: the trailing partial already decoded the tail.
 
     The model lock made stop wait for that partial and then decode the same
     bytes again — 2-3.5 s per flush on the Mac.
     """
     spy = decoder
+    monkeypatch.setattr(server, "ASR_PARTIALS_ENABLED", True)
     with client.websocket_connect("/ws/transcribe") as ws:
         start(ws, "sess-reuse")
         seq = send_speech(ws, 1.0, 0)

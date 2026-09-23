@@ -1,5 +1,27 @@
 # xc-mac-studio MLX host: restart wedge (2026-07-24)
 
+> **ROOT CAUSE (2026-09-23) — read this first; the diagnosis below is superseded.**
+> It was never MLX or Metal. A launchd job running a non-Apple binary (the Homebrew
+> python) blocks forever in `open()` on any file on the EXTERNAL volume `/opt/xc-data`.
+> spindump of the stuck thread:
+>
+>     mac_vnode_check_open -> Sandbox hook_vnode_check_open
+>       -> approval_solicit -> __WAITING_ON_APPROVAL_FROM_SANDBOXD__
+>
+> a consent request no background process can have answered. It never errors. Anything
+> started over ssh inherits sshd's Full Disk Access, which is why it never reproduced by
+> hand. July's "fix" (cache back on internal disk) was the right move for a reason
+> nobody knew; the wedge returned when `~/hf-cache` was offloaded again on 2026-09-21.
+> Verified with a probe job: user agent hangs, system daemon with `UserName=ubuntu`
+> hangs, root daemon reads, `/bin/bash` reads (Apple binaries are exempt).
+>
+> **Permanent state:** `HF_HOME=~/hf-cache` is a real directory on the internal disk
+> (the external copy is kept at `~/hf-cache.external-symlink.bak`);
+> `xc-setup/scripts/xc-data-offload.sh` refuses to offload anything a launchd job reads;
+> and `server.py` probes cache access at startup with a 15 s bound. If it cannot open
+> the cache, it logs `MODEL CACHE UNREACHABLE` and `/health` reports
+> `model_cache_unreachable`, instead of hanging silently.
+
 Status: **RESOLVED 2026-07-24** — the model cache was moved back to internal storage
 (`~/.cache/huggingface` is a real directory again, not a symlink to `/opt/xc-data`).
 polyasr now restarts under launchd, verified twice, and negotiates protocol v2.

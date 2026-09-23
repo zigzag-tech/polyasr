@@ -439,6 +439,7 @@ def compute_health(
     fail_threshold: int,
     last_ok_age_sec: Optional[float],
     stale_after_sec: Optional[float],
+    cache_unreachable: bool = False,
 ) -> tuple[str, list[str]]:
     """Derive (status, reasons) — the honest health of the streaming path.
 
@@ -455,6 +456,8 @@ def compute_health(
         (consecutive_failures == 0) through a total outage.
     """
     reasons: list[str] = []
+    if cache_unreachable:
+        reasons.append("model_cache_unreachable")
     if not weights_present:
         reasons.append("weights_missing")
     if probe_enabled:
@@ -472,6 +475,55 @@ class ModelUnavailable(RuntimeError):
     surface as a hard failure, never as an empty transcript. See
     docs/health-honesty.md.
     """
+
+
+# Set when the model cache cannot be opened at all. See _probe_model_cache_access.
+_cache_access_error: Optional[str] = None
+CACHE_ACCESS_TIMEOUT_SEC = float(_env("CACHE_ACCESS_TIMEOUT_SEC", "15"))
+
+
+def _probe_model_cache_access() -> Optional[str]:
+    """Can this process OPEN files in the HF cache? Bounded; returns the error.
+
+    On macOS a launchd-started process that opens a file on an external volume
+    (xc-mac-studio: /opt/xc-data, where the home-offload symlinks point) blocks
+    in the kernel waiting for a consent approval nobody can give:
+
+        mac_vnode_check_open -> Sandbox approval_solicit
+          -> __WAITING_ON_APPROVAL_FROM_SANDBOXD__
+
+    It never returns and never errors, so the model load hung forever with the
+    service "running". Processes started over ssh inherit sshd's Full Disk
+    Access, which is why it never reproduced by hand. This turns that silent
+    wedge into a named, logged refusal. docs/mlx-host-restart-wedge.md.
+    """
+    from huggingface_hub import constants
+    hub = constants.HF_HUB_CACHE
+    done = threading.Event()
+    failure: list[str] = []
+
+    def touch():
+        try:
+            for name in os.listdir(hub):
+                path = os.path.join(hub, name)
+                if os.path.isfile(path):
+                    with open(path, "rb") as f:
+                        f.read(1)
+                    break
+        except OSError as e:
+            failure.append(repr(e))
+        finally:
+            done.set()
+
+    # Daemon thread: if the open is stuck in the kernel it stays stuck, but it
+    # no longer holds the model lock or the GPU thread.
+    threading.Thread(target=touch, name="cache-access-probe", daemon=True).start()
+    if not done.wait(CACHE_ACCESS_TIMEOUT_SEC):
+        return (f"opening files in {os.path.realpath(hub)} did not return in "
+                f"{CACHE_ACCESS_TIMEOUT_SEC:.0f}s. On macOS this is the sandbox "
+                "waiting for consent to an external volume: keep HF_HOME on the "
+                "internal disk for launchd services")
+    return failure[0] if failure else None
 
 
 def _asr_weights_present() -> bool:
@@ -498,6 +550,8 @@ def _asr_weights_present() -> bool:
 
 def _load_asr_model():
     """Loader for the streaming/batch ASR model (managed unit 'asr')."""
+    if _cache_access_error:
+        raise ModelUnavailable(f"model cache unreachable: {_cache_access_error}")
     log.info("Loading model %s ...", MODEL_NAME)
     import mlx_qwen3_asr
     session = mlx_qwen3_asr.Session(MODEL_NAME)
@@ -876,6 +930,14 @@ except ImportError:
 
 @app.on_event("startup")
 async def startup_event():
+    global _cache_access_error
+    _cache_access_error = _probe_model_cache_access()
+    if _cache_access_error:
+        log.critical("MODEL CACHE UNREACHABLE — ASR will not load: %s",
+                     _cache_access_error)
+        await _refresh_weights_state(force=True)
+        return
+    log.info("Model cache access: ok")
     log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
 
     # Load the model ON the GPU worker thread so the MLX Metal stream is created
@@ -944,10 +1006,12 @@ async def health():
         fail_threshold=ASR_PROBE_FAIL_RELOAD,
         last_ok_age_sec=last_ok_age,
         stale_after_sec=_probe_stale_after(),
+        cache_unreachable=bool(_cache_access_error),
     )
     return {
         "status": status,
         "reasons": reasons,
+        "cache_access_error": _cache_access_error,
         "weights_present": weights_present,
         "model": MODEL_NAME,
         "memory_mb": {
@@ -2661,6 +2725,10 @@ def _probe_stale_after() -> Optional[float]:
 async def _refresh_weights_state(force: bool = False) -> bool:
     """Re-check (off-thread) whether the model is loadable from the local cache."""
     now = time.monotonic()
+    if _cache_access_error:
+        # Checking would open cache files and block an executor thread forever.
+        _weights_state.update(present=False, checked_monotonic=now)
+        return False
     if (
         not force
         and _weights_state["checked_monotonic"]
