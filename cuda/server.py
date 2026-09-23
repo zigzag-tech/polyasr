@@ -260,6 +260,11 @@ class AsrProtocolSession:
         self.raw_signal_bytes = 0
         self.raw_signal_bytes_at_last_partial = 0
         self.native_stream_state = None
+        # The connection's CoverageLedger. Kept here so a resumed connection
+        # continues it: a fresh ledger on resume could only claim the bytes the
+        # NEW socket carried, so every final after a mid-dictation reconnect
+        # read as uncovered and sent the client to a full re-upload.
+        self.ledger = None
         self.final_text = None
         self.final_stop_id = None
         # Coverage proof for the cached final: the highest contiguous client
@@ -1641,8 +1646,12 @@ async def _ws_transcribe_impl(ws: WebSocket):
             stable_text=stable_text,
             stable_bytes=stable_bytes,
         )
+        protocol_session.ledger = ledger
 
     def hydrate_from_protocol_session(sess: AsrProtocolSession) -> None:
+        nonlocal ledger
+        if sess.ledger is not None:
+            ledger = sess.ledger
         nonlocal gated_audio, pending_audio, raw_audio, raw_partial_audio
         nonlocal partial_audio, staging, gate_state, reference_embedding
         nonlocal last_partial_text, raw_signal_bytes
@@ -1819,6 +1828,12 @@ async def _ws_transcribe_impl(ws: WebSocket):
 
     async def feed_native_partial(audio_bytes: bytes) -> None:
         if not using_native_stream():
+            return
+        if getattr(native_stream_state, "finished", False):
+            # Late frames after this stream was sealed (a resume delivering
+            # audio that missed the first stop). They are already in raw_audio;
+            # a reissued stop re-decodes from there. Feeding a sealed R2T2
+            # stream raises and would kill the connection.
             return
         text = await feed_native_stream(native_stream_state, audio_bytes)
         await emit_partial(text, len(raw_audio) / BYTES_PER_SEC)
@@ -2297,9 +2312,30 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         "final_captured_seq": final_captured_seq,
                         "control_protocol": control_protocol,
                     })
+                    # A cached final that does not cover what the client says it
+                    # captured is not an answer to replay: the client reissues
+                    # precisely because the first final came back short (audio
+                    # still in flight at stop). The resume has since delivered
+                    # the rest, so finalize again over what is now held rather
+                    # than hand back the same short answer and force the client
+                    # to re-upload the whole recording.
+                    cached_seq = protocol_session.final_recognized_through_seq
+                    cached_short = (
+                        protocol_session.final_stop_id == protocol_stop_id
+                        and protocol_session.final_text is not None
+                        and final_captured_seq is not None
+                        and (cached_seq is None or cached_seq < final_captured_seq)
+                    )
+                    if cached_short:
+                        slog.event("stop_refinalize_uncovered", {
+                            "stop_id": protocol_stop_id,
+                            "cached_through_seq": cached_seq,
+                            "final_captured_seq": final_captured_seq,
+                            "ack_seq": protocol_session.highest_contiguous_seq,
+                        })
                     # Reconnect reissues the SAME stop id; answer it from the
                     # cache so one utterance is finalized once.
-                    if protocol_session.stop_result_is_fresh(protocol_stop_id):
+                    elif protocol_session.stop_result_is_fresh(protocol_stop_id):
                         payload = {
                             "type": "final",
                             "sessionId": protocol_session.session_id,
@@ -2319,7 +2355,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                             "stopId": protocol_stop_id,
                         })
                         break
-                    if (
+                    elif (
                         protocol_session.final_stop_id == protocol_stop_id
                         and protocol_session.final_text is not None
                     ):
@@ -2365,6 +2401,16 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         # appended to the buffers but never handed to the native
                         # decoder; feed it before sealing, or the transcript is
                         # missing the very tail the wait existed to collect.
+                        if getattr(native_stream_state, "finished", False):
+                            # Re-finalizing (stop_refinalize_uncovered): a sealed
+                            # stream cannot take the late audio, so decode what
+                            # this session holds on a fresh one. One local decode
+                            # instead of the client re-uploading everything.
+                            native_stream_state = init_native_stream(asr_context)
+                            native_pending_feed.clear()
+                            slog.event("native_stream_redecode", {
+                                "audio_sec": len(raw_audio) / BYTES_PER_SEC})
+                            await feed_native_partial(bytes(raw_audio))
                         if native_pending_feed:
                             await feed_native_partial(bytes(native_pending_feed))
                             native_pending_feed.clear()

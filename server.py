@@ -315,6 +315,11 @@ class AsrProtocolSession:
         self.raw_signal_bytes = 0
         self.raw_signal_bytes_at_last_partial = 0
         self.native_stream_state = None
+        # The connection's CoverageLedger. Kept here so a resumed connection
+        # continues it: a fresh ledger on resume could only claim the bytes the
+        # NEW socket carried, so every final after a mid-dictation reconnect
+        # read as uncovered and sent the client to a full re-upload.
+        self.ledger = None
         self.final_text = None
         self.final_stop_id = None
         # Coverage proof for the cached final: the highest contiguous client
@@ -1763,8 +1768,12 @@ async def ws_transcribe(ws: WebSocket):
             stable_text=stable_text,
             stable_bytes=stable_bytes,
         )
+        protocol_session.ledger = ledger
 
     def hydrate_from_protocol_session(sess: AsrProtocolSession) -> None:
+        nonlocal ledger
+        if sess.ledger is not None:
+            ledger = sess.ledger
         nonlocal gated_audio, pending_audio, raw_audio, raw_partial_audio
         nonlocal partial_audio, staging, gate_state
         nonlocal reference_embedding, last_partial_text, raw_signal_bytes
@@ -2405,9 +2414,30 @@ async def ws_transcribe(ws: WebSocket):
                         "final_captured_seq": final_captured_seq,
                         "control_protocol": control_protocol,
                     })
+                    # A cached final that does not cover what the client says it
+                    # captured is not an answer to replay: the client reissues
+                    # precisely because the first final came back short (audio
+                    # still in flight at stop). The resume has since delivered
+                    # the rest, so finalize again over what is now held rather
+                    # than hand back the same short answer and force the client
+                    # to re-upload the whole recording.
+                    cached_seq = protocol_session.final_recognized_through_seq
+                    cached_short = (
+                        protocol_session.final_stop_id == protocol_stop_id
+                        and protocol_session.final_text is not None
+                        and final_captured_seq is not None
+                        and (cached_seq is None or cached_seq < final_captured_seq)
+                    )
+                    if cached_short:
+                        slog.event("stop_refinalize_uncovered", {
+                            "stop_id": protocol_stop_id,
+                            "cached_through_seq": cached_seq,
+                            "final_captured_seq": final_captured_seq,
+                            "ack_seq": protocol_session.highest_contiguous_seq,
+                        })
                     # Reconnect reissues the SAME stop id; answer it from the
                     # cache so one utterance is finalized once.
-                    if protocol_session.stop_result_is_fresh(protocol_stop_id):
+                    elif protocol_session.stop_result_is_fresh(protocol_stop_id):
                         payload = {
                             "type": "final",
                             "sessionId": protocol_session.session_id,
@@ -2427,7 +2457,7 @@ async def ws_transcribe(ws: WebSocket):
                             "stopId": protocol_stop_id,
                         })
                         break
-                    if (
+                    elif (
                         protocol_session.final_stop_id == protocol_stop_id
                         and protocol_session.final_text is not None
                     ):
