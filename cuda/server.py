@@ -54,6 +54,10 @@ from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # 
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
 from runtime_preflight import validate_pytorch_stack  # noqa: E402
+from asr_backends import load_backend  # noqa: E402
+from backend_config import BackendController, DEFAULTS, context_text  # noqa: E402
+from log_storage import prune_log_storage  # noqa: E402
+from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,10 +78,26 @@ def _envflag(name: str, default: str) -> bool:
 
 # 1.7B is the default on this node — the RTX 3090 has enough VRAM and
 # the better-quality 1.7B weights are why we're here instead of on MLX.
-MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-1.7B")
 DEVICE = _env("DEVICE", "cuda:0")
 DTYPE = _env("DTYPE", "bfloat16")  # bfloat16 | float16
-ASR_BACKEND = _env("BACKEND", "transformers").lower()
+def _config_path() -> Path:
+    for index, value in enumerate(sys.argv[:-1]):
+        if value == "--config":
+            return Path(sys.argv[index + 1]).expanduser().resolve()
+    return Path(__file__).with_name("asr-config.json")
+
+
+backend_controller = BackendController(_config_path(), fallback=DEFAULTS)
+_asr_evidence = AsrEvidence()
+
+
+def _asr_settings() -> dict:
+    return backend_controller.current
+
+
+def _model_name() -> str:
+    settings = _asr_settings()
+    return settings[settings["backend"]]["model"]
 # Forced aligner (loaded lazily by /v1/align as a separate managed unit).
 ALIGNER_MODEL = _env("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 # Speaker-diarization unit (pyannote, loaded lazily by /v1/diarize). Runs on the
@@ -90,13 +110,8 @@ IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
 # benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
 # historical one-model-in-VRAM eviction behaviour.
 COLOAD = _envflag("COLOAD", "1")
-ASR_NATIVE_STREAMING = (
-    _env("NATIVE_STREAMING", "1" if ASR_BACKEND == "vllm" else "0").lower()
-    not in {"0", "false", "no"}
-)
 ASR_FINAL_WAIT_PARTIAL = _envflag("FINAL_WAIT_PARTIAL", "0")
 ASR_PARTIALS_ENABLED = _envflag("PARTIALS_ENABLED", "1")
-ASR_STREAM_CHUNK_SEC = float(_env("STREAM_CHUNK_SEC", "2.0"))
 FAKE_TRANSCRIBE = _env("FAKE_TRANSCRIBE", "").lower() in {"1", "true", "yes"}
 FAKE_TRANSCRIBE_DELAY_SEC = float(_env("FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
 _vad_model = None
@@ -155,8 +170,11 @@ VAD_THRESHOLD = 0.5
 # on very short clips are unstable.
 MIN_EMBED_SEC = 1.0
 MIN_EMBED_BYTES_CONST = int(MIN_EMBED_SEC * 16000 * 2)
-# Cosine similarity threshold for "same speaker as reference".
-SPEAKER_SIM_THRESHOLD = 0.70
+# Cosine similarity threshold for "same speaker as reference". Was 0.70, which
+# rejected the account owner's own voice: over 7 days (2026-09-16..23) every
+# rejected score sat between 0.59 and 0.70 — 69 rejects, 259 s of speech — and
+# each one froze coverage and sent the dictation to a full batch re-upload.
+SPEAKER_SIM_THRESHOLD = float(_env("SPEAKER_SIM_THRESHOLD", "0.50"))
 ASR_PROTOCOL_VERSION = 1
 ASR_FRAME_MAGIC = b"BASR"
 ASR_FRAME_HEADER_BYTES = 16
@@ -224,9 +242,12 @@ class AsrProtocolSession:
     def __init__(self, session_id: str):
         now = time.monotonic()
         self.session_id = session_id
+        self.backend = _asr_settings()["backend"]
+        self.context = ""
         self.created = now
         self.updated = now
         self.chunks = {}
+        self.accepted_bytes = 0
         self.highest_contiguous_seq = -1
         self.gated_audio = bytearray()
         self.pending_audio = bytearray()
@@ -255,10 +276,22 @@ class AsrProtocolSession:
         self.stable_bytes = 0
 
     def accept(self, seq: int, payload: bytes) -> bool:
+        if time.monotonic() - self.created > _asr_settings()["max_session_seconds"]:
+            raise ValueError("ASR session exceeds configured duration limit")
+        if not isinstance(seq, int) or seq < 0:
+            raise ValueError("audio sequence must be a nonnegative integer")
+        if seq > int(_asr_settings()["max_session_seconds"] * 1000):
+            raise ValueError("audio sequence exceeds configured session limit")
+        if len(payload) > 2 * 16000 * 2:
+            raise ValueError("audio frame exceeds 2 seconds")
+        max_bytes = int(_asr_settings()["max_session_seconds"] * 16000 * 2)
+        if self.accepted_bytes + len(payload) > max_bytes:
+            raise ValueError("ASR session exceeds configured duration limit")
         self.updated = time.monotonic()
         if seq in self.chunks:
             return False
         self.chunks[seq] = payload
+        self.accepted_bytes += len(payload)
         while self.highest_contiguous_seq + 1 in self.chunks:
             self.highest_contiguous_seq += 1
         return True
@@ -312,16 +345,36 @@ _protocol_sessions = {}
 
 def _prune_protocol_sessions():
     now = time.monotonic()
+    ttl = min(ASR_RESUME_TTL_SEC, _asr_settings()["max_session_seconds"])
     stale = [
         sid for sid, sess in _protocol_sessions.items()
-        if now - sess.updated > ASR_RESUME_TTL_SEC
+        if now - sess.updated > ttl
     ]
     for sid in stale:
         _protocol_sessions.pop(sid, None)
 
 
-def _new_protocol_session(session_id: str) -> AsrProtocolSession:
+def _ensure_session_capacity() -> None:
     _prune_protocol_sessions()
+    limit = _asr_settings()["max_sessions"]
+    if len(_protocol_sessions) < limit:
+        return
+    # Empty handshakes and completed results do not own unfinalized audio. Drop
+    # the oldest of those first; live resumable audio is never silently evicted.
+    removable = sorted(
+        (session for session in _protocol_sessions.values()
+         if not session.chunks or session.final_text is not None),
+        key=lambda session: session.updated,
+    )
+    for session in removable:
+        _protocol_sessions.pop(session.session_id, None)
+        if len(_protocol_sessions) < limit:
+            return
+    raise RuntimeError("ASR resumable-session limit reached")
+
+
+def _new_protocol_session(session_id: str) -> AsrProtocolSession:
+    _ensure_session_capacity()
     sess = AsrProtocolSession(session_id)
     _protocol_sessions[session_id] = sess
     return sess
@@ -331,6 +384,7 @@ def _get_or_create_protocol_session(session_id: str) -> AsrProtocolSession:
     _prune_protocol_sessions()
     sess = _protocol_sessions.get(session_id)
     if sess is None:
+        _ensure_session_capacity()
         sess = AsrProtocolSession(session_id)
         _protocol_sessions[session_id] = sess
     return sess
@@ -358,21 +412,12 @@ def _torch_dtype():
 
 def _load_asr_model():
     """Loader for the streaming/batch ASR model (managed unit 'asr')."""
-    log.info(
-        "Loading model %s on %s (%s, backend=%s) ...",
-        MODEL_NAME, DEVICE, DTYPE, ASR_BACKEND,
-    )
-    from qwen_asr import Qwen3ASRModel
-    if ASR_BACKEND == "vllm":
-        model = Qwen3ASRModel.LLM(MODEL_NAME, dtype=DTYPE, max_new_tokens=512)
-    else:
-        import torch  # noqa: F401 — used indirectly via dtype
-        model = Qwen3ASRModel.from_pretrained(
-            MODEL_NAME,
-            dtype=_torch_dtype(),
-            device_map=DEVICE,
-            max_new_tokens=512,
-        )
+    global _loaded_backend
+    settings = _asr_settings()
+    log.info("Loading ASR model %s on %s (%s, backend=%s) ...",
+             _model_name(), DEVICE, DTYPE, settings["backend"])
+    model = load_backend(settings, device=DEVICE, dtype=DTYPE)
+    _loaded_backend = model
     log.info("ASR model loaded successfully.")
     return model
 
@@ -381,11 +426,12 @@ def _load_align_model():
     """Loader for the forced-alignment model (managed unit 'align'): an ASR
     model bundled with the forced aligner so transcribe(return_time_stamps=True)
     emits per-char timestamps."""
-    log.info("Loading aligner %s + %s on %s ...", MODEL_NAME, ALIGNER_MODEL, DEVICE)
+    qwen_model = _asr_settings()["qwen"]["model"]
+    log.info("Loading aligner %s + %s on %s ...", qwen_model, ALIGNER_MODEL, DEVICE)
     import torch
     from qwen_asr import Qwen3ASRModel
     model = Qwen3ASRModel.from_pretrained(
-        MODEL_NAME,
+        qwen_model,
         dtype=_torch_dtype(),
         device_map=DEVICE,
         # Dense Chinese narration in a 270s chunk can be ~600-1200 chars; 256
@@ -409,16 +455,49 @@ def _load_diarize_model():
     return pipeline
 
 
-# polycore model units. asr is HARD_PIN — benchday needs it hot at all times; it
-# is never idle-evicted. align/diarize are demand-driven (load lazily, evict when
-# idle). The manager + residency policy (LocalCoordinator standalone, or livestack's
-# LivestackCoordinator) is wired by attach() once `app` exists, below.
+# polycore model units. asr is HARD_PIN by default — benchday needs an engine hot
+# at all times; it is never idle-evicted. align/diarize are demand-driven (load
+# lazily, evict when idle). The manager + residency policy (LocalCoordinator
+# standalone, or livestack's LivestackCoordinator) is wired by attach() once `app`
+# exists, below.
+#
+# A SECOND polyasr sharing one card is a different case, and the reason this tier
+# is a knob. Residency is per PROCESS: two nodes serving `asr` on one GPU hold two
+# copies of the weights, and two HARD_PINs are two floors neither of which Harmony
+# may ever preempt. On xc-tower-ubuntu that was 9.5 GB of un-evictable VRAM on a
+# 24 GB card sitting at 96%, for a replica serving 3 requests a day. The replica is
+# worth having for concurrency; it is not worth a permanent floor. So the PRIMARY
+# keeps the floor and a replica sets POLYASR_ASR_RESIDENCY=unpinned (or soft_pin,
+# to stay warm until the card is actually under pressure) and earns its residence.
 HOST_ID = _env("HOST_ID", "zz-tower0")
+_RESIDENCY_TIERS = {"hard_pin": ResidencyPolicy.HARD_PIN,
+                    "soft_pin": ResidencyPolicy.SOFT_PIN,
+                    "unpinned": ResidencyPolicy.UNPINNED}
+_asr_tier = _env("ASR_RESIDENCY", "hard_pin").strip().lower()
+if _asr_tier not in _RESIDENCY_TIERS:
+    # A typo must not stop this node serving, and must not silently unpin the
+    # engine benchday depends on: fall back to the safe tier and say so.
+    log.warning("POLYASR_ASR_RESIDENCY=%r is not one of %s — using hard_pin",
+                _asr_tier, ", ".join(sorted(_RESIDENCY_TIERS)))
+    _asr_tier = "hard_pin"
+_loaded_backend = None
+
+
+def _free_asr_backend():
+    global _loaded_backend
+    if _loaded_backend is not None:
+        try:
+            _loaded_backend.close()
+        finally:
+            _loaded_backend = None
+    free_cuda()
+
+
 _UNITS = {
     # footprint = VRAM bytes (weights + peak activation). Initial estimates from the
     # 2026-06-27 align OOM + /health; refine with livestack_node.measure_footprint().
-    "asr": ManagedUnit("asr", _load_asr_model, free_cuda, footprint=5_000_000_000,
-                       residency_policy=ResidencyPolicy.HARD_PIN),
+    "asr": ManagedUnit("asr", _load_asr_model, _free_asr_backend, footprint=8_000_000_000,
+                       residency_policy=_RESIDENCY_TIERS[_asr_tier]),
     "align": ManagedUnit("align", _load_align_model, free_cuda, footprint=3_000_000_000),
     "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda, footprint=2_500_000_000),
 }
@@ -553,7 +632,7 @@ class SessionLogger:
             self.events_file = open(self.dir / "events.jsonl", "w", encoding="utf-8")
             self.enabled = True
             self.event("start", {"session_id": self.session_id, "kind": kind,
-                                 "model": MODEL_NAME, "backend": "cuda"})
+                                 "model": _model_name(), "backend": "cuda"})
         except Exception:
             log.exception("SessionLogger init failed; logging disabled for this session")
             self.enabled = False
@@ -586,9 +665,11 @@ class SessionLogger:
         """Close handles and transcode PCM → FLAC. Safe to call once."""
         if not self.enabled:
             return
-        self.enabled = False
+        # Logged BEFORE disabling: event() is a no-op once disabled, so the
+        # other order never wrote `close` or the session's duration.
         self.event("close", {"audio_bytes": self.bytes_written,
                              "duration_ms": self._ms()})
+        self.enabled = False
         try:
             if self.pcm_file:
                 self.pcm_file.close()
@@ -612,6 +693,10 @@ class SessionLogger:
                 pcm_path.unlink()  # empty file — drop it
         except Exception:
             log.exception("FLAC transcode failed; keeping .pcm")
+        try:
+            prune_log_storage(LOG_DIR)
+        except Exception:
+            log.exception("polyASR log retention failed")
 
 
 def _log_http_request(audio_bytes: bytes, filename: str, text: str,
@@ -630,11 +715,12 @@ def _log_http_request(audio_bytes: bytes, filename: str, text: str,
         meta = {"timestamp": now.isoformat(timespec="seconds"),
                 "filename": filename,
                 "language": language,
-                "model": MODEL_NAME,
+                "model": _model_name(),
                 "backend": "cuda",
                 "text": text}
         (prefix.with_suffix(".json")).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        prune_log_storage(LOG_DIR)
     except Exception:
         log.exception("HTTP request logging failed")
 
@@ -660,27 +746,17 @@ def rms_energy(pcm_data: bytes) -> float:
 
 
 def native_streaming_available() -> bool:
-    if not ASR_NATIVE_STREAMING or FAKE_TRANSCRIBE:
+    if FAKE_TRANSCRIBE:
         return False
     with _transcribe_lock:
         session = get_session()
-    return all(
-        hasattr(session, name)
-        for name in (
-            "init_streaming_state",
-            "streaming_transcribe",
-            "finish_streaming_transcribe",
-        )
-    ) and getattr(session, "backend", None) == "vllm"
+    return bool(getattr(session, "native_streaming", False))
 
 
 def init_native_stream(context: str):
     with _transcribe_lock:
         session = get_session()
-    return session.init_streaming_state(
-        context=context or "",
-        chunk_size_sec=ASR_STREAM_CHUNK_SEC,
-    )
+    return session.init_stream(context)
 
 
 async def feed_native_stream(state, pcm_data: bytes) -> str:
@@ -693,10 +769,9 @@ async def feed_native_stream(state, pcm_data: bytes) -> str:
 
     def run_feed():
         with _transcribe_lock:
-            return get_session().streaming_transcribe(pcm, state)
+            return get_session().feed_stream(state, pcm)
 
-    await loop.run_in_executor(None, run_feed)
-    return (getattr(state, "text", "") or "").strip()
+    return (await loop.run_in_executor(None, run_feed) or "").strip()
 
 
 async def finish_native_stream(state) -> str:
@@ -706,10 +781,9 @@ async def finish_native_stream(state) -> str:
 
     def run_finish():
         with _transcribe_lock:
-            return get_session().finish_streaming_transcribe(state)
+            return get_session().finish_stream(state)
 
-    await loop.run_in_executor(None, run_finish)
-    return (getattr(state, "text", "") or "").strip()
+    return (await loop.run_in_executor(None, run_finish) or "").strip()
 
 
 def _flatten_result_text(result) -> str:
@@ -764,10 +838,19 @@ try:
         with _in_flight_lock:
             return _in_flight_count
 
+    def _inventory() -> dict:
+        cfg = _asr_settings()
+        name = backend_controller.active or cfg["backend"]
+        selected = cfg[name]
+        streaming = "native" if name == "r2t2" or selected.get("native_streaming") else "synthetic"
+        return evidence_inventory(backend=name, model=selected["model"],
+                                  model_revision=selected["revision"], streaming=streaming,
+                                  evidence=_asr_evidence)
+
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
-                                in_flight=_count)
+                                in_flight=_count, inventory=_inventory)
 except ImportError:
     from livestack_node import ModelManager
     manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -793,9 +876,39 @@ async def _idle_evict_loop():
             log.exception("idle-evict sweep failed")
 
 
+def _has_unfinished_sessions() -> bool:
+    _prune_protocol_sessions()
+    return any(session.final_text is None for session in _protocol_sessions.values())
+
+
+def _activate_configured_backend() -> None:
+    if FAKE_TRANSCRIBE:
+        return
+    with _transcribe_lock:
+        try:
+            manager.recover("asr")
+        except AttributeError as exc:
+            # Older LivestackCoordinator deployments predate the optional
+            # degradation notification. ModelManager raises only after its
+            # reload has succeeded; verify that exact state before accepting it.
+            expected = _asr_settings()["backend"]
+            if ("on_degraded" not in str(exc)
+                    or _loaded_backend is None
+                    or _loaded_backend.name != expected
+                    or not _UNITS["asr"].loaded):
+                raise
+            log.warning("ASR reload succeeded; coordinator has no on_degraded hook")
+
+
+async def _backend_config_loop() -> None:
+    await backend_controller.watch(_has_unfinished_sessions, _activate_configured_backend)
+
+
 @app.on_event("startup")
 async def startup_event():
     if FAKE_TRANSCRIBE:
+        backend_controller.active = _asr_settings()["backend"]
+        asyncio.create_task(_backend_config_loop())
         log.info("POLYASR_FAKE_TRANSCRIBE enabled; skipping model/VAD/encoder preload.")
         return
     versions = validate_pytorch_stack()
@@ -804,11 +917,27 @@ async def startup_event():
     # gigabytes for Qwen. A broken VAD/encoder must fail cheap.
     get_vad()
     get_encoder()
+    if LOG_DIR is not None:
+        prune_log_storage(LOG_DIR)
     log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
     with _transcribe_lock:
         get_session()
+    backend_controller.active = _asr_settings()["backend"]
     asyncio.create_task(_idle_evict_loop())
+    asyncio.create_task(_backend_config_loop())
     log.info("Server ready.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if manager is None:
+        return
+    loop = asyncio.get_event_loop()
+    def unload():
+        with _transcribe_lock:
+            return manager.unload_now()
+    await loop.run_in_executor(None, unload)
+    log.info("Server shutdown released managed model executors.")
 
 
 @app.get("/health")
@@ -825,9 +954,13 @@ async def health():
             }
     except Exception:
         pass
-    return {"status": "ok", "model": MODEL_NAME, "backend": "cuda",
-            "dtype": DTYPE, "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
+    backend = backend_controller.status()
+    body = {"status": "error" if backend["error"] else "ok",
+            "model": _model_name(), "backend": "cuda",
+            "asr_backend": backend, "dtype": DTYPE,
+            "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
             "manager": manager.status()}
+    return JSONResponse(body, status_code=503 if backend["error"] else 200)
 
 
 @app.post("/model/unload")
@@ -835,6 +968,8 @@ async def model_unload():
     """Force-evict the resident model from VRAM (and return freed heap to the
     OS) without stopping the server, so a co-resident workload can reclaim the
     GPU. The model reloads lazily on the next transcribe/align."""
+    if backend_controller.requests or _has_unfinished_sessions():
+        raise HTTPException(status_code=409, detail="ASR recognition has not drained")
     loop = asyncio.get_event_loop()
 
     def do_unload():
@@ -856,18 +991,29 @@ async def transcribe(
     context: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
 ):
-    with _in_flight():
-        return await _transcribe_impl(file, model, language, context, response_format)
+    try:
+        async with backend_controller.request():
+            with _in_flight():
+                return await _transcribe_impl(file, model, language, context, response_format)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 async def _transcribe_impl(file, model, language, context, response_format):
     t0 = time.monotonic()
+    try:
+        context = context_text(context, _asr_settings())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        content = await file.read()
+        upload_limit = _asr_settings()["max_upload_bytes"]
+        content = await file.read(upload_limit + 1)
         if not content:
             raise HTTPException(status_code=422, detail="empty upload: no audio bytes")
+        if len(content) > upload_limit:
+            raise HTTPException(status_code=413, detail="audio upload exceeds configured byte limit")
         tmp.write(content)
         tmp.flush()
         tmp.close()
@@ -903,6 +1049,8 @@ async def _transcribe_impl(file, model, language, context, response_format):
         lang = _flatten_result_language(result)
 
         elapsed = time.monotonic() - t0
+        _asr_evidence.observe("finalization_ms", elapsed * 1000)
+        _asr_evidence.observe("failure", 0)
         log.info("Transcribed in %.2fs: %s", elapsed, text[:80])
         _log_http_request(content, file.filename or "upload", text, language)
 
@@ -922,6 +1070,7 @@ async def _transcribe_impl(file, model, language, context, response_format):
         # catch-all below would otherwise re-map it to a retryable 500.
         raise
     except Exception as e:
+        _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -992,7 +1141,7 @@ def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int
     }
 
 
-_ALIGN_MODEL_LABEL = f"{MODEL_NAME} + {ALIGNER_MODEL}"
+_ALIGN_MODEL_LABEL = f"{DEFAULTS['qwen']['model']} + {ALIGNER_MODEL}"
 
 
 def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
@@ -1196,6 +1345,21 @@ PARTIAL_INTERVAL_SEC = float(_env("PARTIAL_INTERVAL_SEC", "0.6"))
 PARTIAL_MIN_DELTA_SEC = float(_env("PARTIAL_MIN_DELTA_SEC", "0.5"))
 PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
+# Once the speaker goes quiet, a smaller remainder is still owed a partial. The
+# minimum above only ever advances on NEW sound, so trailing words worth less
+# than PARTIAL_MIN_DELTA_SEC of signal, followed by silence, were never shown:
+# the last partial sat on screen short of the utterance until the final.
+PARTIAL_TRAILING_IDLE_SEC = float(_env("PARTIAL_TRAILING_IDLE_SEC", "0.4"))
+
+
+def partial_due(new_signal_bytes: int, since_partial_sec: float,
+                since_signal_sec: float) -> bool:
+    """Whether unseen speech warrants another live partial now."""
+    if new_signal_bytes <= 0 or since_partial_sec < PARTIAL_INTERVAL_SEC:
+        return False
+    return (new_signal_bytes >= PARTIAL_MIN_DELTA_BYTES
+            or since_signal_sec >= PARTIAL_TRAILING_IDLE_SEC)
+
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
 # sentences; the final pass still transcribes the full utterance.
@@ -1370,12 +1534,20 @@ def _process_staged_audio(staging, prev_window, gate_state):
 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
-    with _in_flight():
-        await _ws_transcribe_impl(ws)
+    try:
+        async with backend_controller.request():
+            with _in_flight():
+                await _ws_transcribe_impl(ws)
+    except RuntimeError as exc:
+        await ws.accept()
+        await ws.send_json({"type": "error", "error": str(exc)})
+        await ws.close(code=1013)
 
 
 async def _ws_transcribe_impl(ws: WebSocket):
     await ws.accept()
+    evidence_started = time.monotonic()
+    evidence_first_partial = False
     log.info("WebSocket client connected")
 
     # Tail-first streaming transcription.
@@ -1409,8 +1581,12 @@ async def _ws_transcribe_impl(ws: WebSocket):
     last_partial_text = ""
     raw_signal_bytes = 0
     raw_signal_bytes_at_last_partial = 0
+    last_signal_time = time.monotonic()
     native_stream_state = None
     partial_task = None
+    # The last incremental partial's decode: (stable_bytes, audio, text). When
+    # stop's tail is byte-identical, that decode IS the tail decode.
+    partial_decode = None
     closing = False
     loop = asyncio.get_event_loop()
     slog = SessionLogger("ws")
@@ -1434,6 +1610,16 @@ async def _ws_transcribe_impl(ws: WebSocket):
     asr_context = ""
 
     async def send_json(payload: dict) -> None:
+        nonlocal evidence_first_partial
+        message_type = payload.get("type")
+        if message_type == "partial" and payload.get("text") and not evidence_first_partial:
+            _asr_evidence.observe("first_partial_ms", (time.monotonic() - evidence_started) * 1000)
+            evidence_first_partial = True
+        elif message_type == "final":
+            _asr_evidence.observe("finalization_ms", (time.monotonic() - evidence_started) * 1000)
+            _asr_evidence.observe("failure", 0)
+        elif message_type == "error":
+            _asr_evidence.observe("failure", 1)
         async with send_lock:
             await ws.send_json(payload)
 
@@ -1709,11 +1895,25 @@ async def _ws_transcribe_impl(ws: WebSocket):
 
                 pending_audio.clear()
 
-    def partial_snapshot() -> bytes:
+    def partial_snapshot():
+        """Audio for the next partial, and the stable prefix it continues.
+
+        Incremental when it can be: the stable prefix is already decoded, so a
+        partial decodes only the accepted speech after it — the same bytes stop
+        will decode — and shows prefix + tail. The text then always runs from
+        the start of the utterance. The 20 s sliding window re-transcribed its
+        overlap differently each time ("QW. QW E and ASR" vs "QWEN ASR"), which
+        the client could not reconcile, so long dictations showed sentences
+        repeated in the draft. The window remains the fallback for a tail too
+        long to decode per partial (stable commits kept coming back empty).
+        """
+        tail = bytes(gated_audio[stable_bytes:]) + bytes(pending_audio)
+        if len(tail) <= PARTIAL_WINDOW_BYTES:
+            return tail, stable_bytes, stable_text
         buf = raw_partial_audio if raw_partial_audio else partial_audio
         if len(buf) > PARTIAL_WINDOW_BYTES:
-            return bytes(buf[-PARTIAL_WINDOW_BYTES:])
-        return bytes(buf)
+            return bytes(buf[-PARTIAL_WINDOW_BYTES:]), None, ""
+        return bytes(buf), None, ""
 
     async def transcribe_partial(buf: bytes) -> str:
         """Transcribe the last N seconds of audio for live partials.
@@ -1727,8 +1927,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
         ).strip()
         return text
 
-    async def run_partial(buf: bytes, signal_snapshot: int) -> None:
-        nonlocal last_partial_time, last_partial_text
+    async def run_partial(buf: bytes, signal_snapshot: int,
+                          prefix_bytes=None, prefix_text: str = "") -> None:
+        nonlocal last_partial_time, last_partial_text, partial_decode
         nonlocal raw_signal_bytes_at_last_partial
         audio_sec = len(buf) / BYTES_PER_SEC
         slog.event("partial_begin", {
@@ -1737,6 +1938,9 @@ async def _ws_transcribe_impl(ws: WebSocket):
         })
         try:
             text = await transcribe_partial(buf)
+            if prefix_bytes is not None:
+                partial_decode = (prefix_bytes, buf, text)
+                text = join_transcript(prefix_text, text)
             if closing:
                 slog.event("partial_suppressed", {"reason": "closing"})
                 return
@@ -1847,12 +2051,28 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 await commit_task
             except Exception:
                 log.exception("Stable prefix commit failed before final")
+        if partial_task is not None and not partial_task.done():
+            # It holds the model lock, so the tail decode would wait for it
+            # anyway — and it may have decoded exactly the tail.
+            try:
+                await partial_task
+            except Exception:
+                log.exception("Partial transcription failed before final")
         tail = bytes(gated_audio[stable_bytes:])
         tail_text = ""
+        reused = (
+            partial_decode is not None
+            and partial_decode[0] == stable_bytes
+            and partial_decode[1] == tail
+        )
         # No length floor: the tail is the end of the utterance and a floor here
         # silently drops a short last word. The decoder is the judge of whether
         # there are words in it.
-        if tail:
+        if reused:
+            # Same bytes, same context, same model: the partial's decode is the
+            # tail decode, so the final covers exactly what it would have.
+            tail_text = partial_decode[2]
+        elif tail:
             tail_text = (
                 await _transcribe_buffer(bytearray(tail), context=asr_context)
                 or ""
@@ -1863,6 +2083,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 "stable_sec": stable_bytes / BYTES_PER_SEC,
                 "tail_sec": len(tail) / BYTES_PER_SEC,
                 "reused_stable": bool(stable_text),
+                "reused_partial_decode": reused,
             })
             return final_text, recognized_frontier()
         # Short commands can fall below the VAD commit threshold, leaving
@@ -1893,18 +2114,17 @@ async def _ws_transcribe_impl(ws: WebSocket):
             return
         now = time.monotonic()
         new_signal_bytes = raw_signal_bytes - raw_signal_bytes_at_last_partial
-        if new_signal_bytes < PARTIAL_MIN_DELTA_BYTES:
+        if not partial_due(new_signal_bytes, now - last_partial_time,
+                           now - last_signal_time):
             return
 
-        if now - last_partial_time < PARTIAL_INTERVAL_SEC:
-            return
-
-        buf = partial_snapshot()
+        buf, prefix_bytes, prefix_text = partial_snapshot()
         if len(buf) < int(BYTES_PER_SEC * 0.3):
             return
 
         signal_snapshot = raw_signal_bytes
-        partial_task = asyncio.create_task(run_partial(buf, signal_snapshot))
+        partial_task = asyncio.create_task(
+            run_partial(buf, signal_snapshot, prefix_bytes, prefix_text))
         partial_task.add_done_callback(observe_partial_task)
 
     try:
@@ -1958,6 +2178,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 if pcm_has_signal(audio_bytes):
                     raw_partial_audio.extend(audio_bytes)
                     raw_signal_bytes += len(audio_bytes)
+                    last_signal_time = time.monotonic()
                 staging.extend(audio_bytes)
                 events = _process_staged_audio(staging, prev_window, gate_state)
                 await apply_events(events)
@@ -2004,13 +2225,36 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         else _get_or_create_protocol_session(protocol_session_id)
                     )
                     hydrate_from_protocol_session(protocol_session)
-                    asr_context = msg.get("context") or ""
+                    try:
+                        requested_context = (
+                            protocol_session.context
+                            if msg_type == "resume" and "context" not in msg
+                            else context_text(msg.get("context"), _asr_settings())
+                        )
+                    except ValueError as exc:
+                        await send_json({"type": "error", "error": str(exc)})
+                        break
+                    if msg_type == "resume" and protocol_session.context != requested_context:
+                        await send_json({
+                            "type": "error",
+                            "error": "resume context does not match the original session",
+                        })
+                        break
+                    if msg_type == "start":
+                        protocol_session.context = requested_context
+                    asr_context = protocol_session.context
+                    if protocol_session.backend != _asr_settings()["backend"]:
+                        await send_json({
+                            "type": "error",
+                            "error": "session backend is no longer active",
+                        })
+                        break
                     if native_streaming_available() and native_stream_state is None:
                         native_stream_state = init_native_stream(asr_context)
                         sync_protocol_session()
                         slog.event("native_stream_started", {
-                            "chunk_sec": ASR_STREAM_CHUNK_SEC,
-                            "backend": ASR_BACKEND,
+                            "chunk_sec": _asr_settings()[_asr_settings()["backend"]]["chunk_seconds"],
+                            "backend": _asr_settings()["backend"],
                         })
                     slog.event("protocol_started", {
                         "session_id": protocol_session_id,

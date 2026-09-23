@@ -17,3 +17,6 @@ server.stderr.log
 
 # Per-session audio/event archives (written at runtime for troubleshooting)
 logs/
+
+/cuda/asr-config.json
+/cuda/venv-r2t2/

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import wave
+import re
 from pathlib import Path
 
 
@@ -173,6 +174,13 @@ def group_chars_into_sentences(
     Returns segments shaped like Whisper's: each has start/end/text and a
     `words` array with start/end/text.
     """
+    # Qwen's aligner uses characters for CJK but word/subword units for Latin
+    # scripts. Sending word units through the character matcher preserves text
+    # but cannot match any timing, collapsing an entire English recording to
+    # 0s. Handle those units explicitly before the character path.
+    if char_timings and any(len(str(t.get("text", "")).strip()) > 1 for t in char_timings):
+        return _group_word_units_into_sentences(char_timings, full_text)
+
     RESYNC_WINDOW = 8  # how far ahead to look for the matching timing
     segments: list[dict] = []
     cur_words: list[dict] = []
@@ -238,3 +246,43 @@ def group_chars_into_sentences(
     flush()
     return segments
 
+
+def _group_word_units_into_sentences(units: list[dict], full_text: str) -> list[dict]:
+    """Map Latin word-unit timings onto the recognizer's sentence text.
+
+    The recognizer and aligner can differ slightly in whitespace/punctuation,
+    so boundaries are assigned by cumulative non-space character weight rather
+    than brittle exact string matching. Text stays byte-for-byte ASR text while
+    timestamps remain monotonic and sourced from the forced aligner.
+    """
+    sentences = [s for s in re.split(r"(?<=[.!?。！？])\s+", full_text) if s.strip()]
+    if not sentences:
+        return []
+    weight = lambda value: max(1, len(re.sub(r"[\W_]+", "", value, flags=re.UNICODE)))
+    weights = [weight(str(u.get("text", ""))) for u in units]
+    sentence_weights = [weight(s) for s in sentences]
+    total_text = max(1, sum(sentence_weights))
+    total_units = sum(weights)
+    results: list[dict] = []
+    unit_start = 0
+    consumed_text = 0
+    consumed_units = 0
+    for index, sentence in enumerate(sentences):
+        consumed_text += sentence_weights[index]
+        target = total_units if index == len(sentences) - 1 else total_units * consumed_text / total_text
+        unit_end = unit_start
+        while unit_end < len(units) and (consumed_units < target or unit_end == unit_start):
+            consumed_units += weights[unit_end]
+            unit_end += 1
+        selected = units[unit_start:unit_end]
+        if selected:
+            results.append({
+                "text": sentence,
+                "start": float(selected[0]["start"]),
+                "end": float(selected[-1]["end"]),
+                "words": [{"text": str(u.get("text", "")),
+                           "start": float(u["start"]), "end": float(u["end"])}
+                          for u in selected],
+            })
+        unit_start = unit_end
+    return results

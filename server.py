@@ -46,6 +46,7 @@ from livestack_node import (ModelManager as AsrModelManager, ManagedUnit, Reside
                       counting, free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
 import polyasr_diarize  # noqa: E402
+from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
 
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 
@@ -67,6 +68,8 @@ def _envflag(name: str, default: str) -> bool:
 
 
 MODEL_NAME = _env("MODEL", "Qwen/Qwen3-ASR-0.6B")
+MODEL_REVISION = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+_asr_evidence = AsrEvidence()
 # MLX forced-alignment models (loaded lazily by /v1/align). The aligner needs an
 # ASR model + a separate forced-aligner model, both via mlx_audio.stt.
 ALIGN_ASR_MODEL = _env("ALIGN_ASR_MODEL", "mlx-community/Qwen3-ASR-0.6B-4bit")
@@ -226,8 +229,11 @@ VAD_THRESHOLD = 0.5
 # on very short clips are unstable.
 MIN_EMBED_SEC = 1.0
 MIN_EMBED_BYTES_CONST = int(MIN_EMBED_SEC * 16000 * 2)
-# Cosine similarity threshold for "same speaker as reference".
-SPEAKER_SIM_THRESHOLD = 0.70
+# Cosine similarity threshold for "same speaker as reference". Was 0.70, which
+# rejected the account owner's own voice: over 7 days (2026-09-16..23) every
+# rejected score sat between 0.59 and 0.70 — 69 rejects, 259 s of speech — and
+# each one froze coverage and sent the dictation to a full batch re-upload.
+SPEAKER_SIM_THRESHOLD = float(_env("SPEAKER_SIM_THRESHOLD", "0.50"))
 ASR_PROTOCOL_VERSION = 1
 ASR_FRAME_MAGIC = b"BASR"
 ASR_FRAME_HEADER_BYTES = 16
@@ -698,9 +704,11 @@ class SessionLogger:
         """Close handles and transcode PCM → FLAC. Safe to call once."""
         if not self.enabled:
             return
-        self.enabled = False
+        # Logged BEFORE disabling: event() is a no-op once disabled, so the
+        # other order never wrote `close` or the session's duration.
         self.event("close", {"audio_bytes": self.bytes_written,
                              "duration_ms": self._ms()})
+        self.enabled = False
         try:
             if self.pcm_file:
                 self.pcm_file.close()
@@ -851,10 +859,15 @@ try:
     # own — no LIVESTACK_PEERS entry, no broker restart. It is the one fact the
     # broker cannot infer (a POST shows it our source address, not what we
     # listen on), and it is the same value we hand uvicorn at the bottom.
+    def _inventory() -> dict:
+        return evidence_inventory(backend="qwen-mlx", model=MODEL_NAME,
+                                  model_revision=MODEL_REVISION, streaming="synthetic",
+                                  evidence=_asr_evidence)
+
     manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
-                                in_flight=_busy)
+                                in_flight=_busy, inventory=_inventory)
     log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
 except ImportError:
     manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
@@ -1051,6 +1064,8 @@ async def transcribe(
         _clear_mlx_cache()
 
         elapsed = time.monotonic() - t0
+        _asr_evidence.observe("finalization_ms", elapsed * 1000)
+        _asr_evidence.observe("failure", 0)
         log.info("Transcribed in %.2fs: %s", elapsed, result.text[:80])
         _log_http_request(content, file.filename or "upload",
                           result.text, language)
@@ -1067,6 +1082,7 @@ async def transcribe(
         else:
             return JSONResponse({"text": result.text})
     except ModelUnavailable as e:
+        _asr_evidence.observe("failure", 1)
         # 503, not 500: the node cannot serve at all (weights gone / unloadable),
         # so callers should route to another node rather than retry here.
         log.critical("ASR model unavailable (batch): %s", e)
@@ -1076,6 +1092,7 @@ async def transcribe(
         # catch-all below would otherwise re-map it to a retryable 500.
         raise
     except Exception as e:
+        _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1380,6 +1397,21 @@ PARTIAL_INTERVAL_SEC = float(_env("PARTIAL_INTERVAL_SEC", "0.6"))
 PARTIAL_MIN_DELTA_SEC = float(_env("PARTIAL_MIN_DELTA_SEC", "0.5"))
 PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
+# Once the speaker goes quiet, a smaller remainder is still owed a partial. The
+# minimum above only ever advances on NEW sound, so trailing words worth less
+# than PARTIAL_MIN_DELTA_SEC of signal, followed by silence, were never shown:
+# the last partial sat on screen short of the utterance until the final.
+PARTIAL_TRAILING_IDLE_SEC = float(_env("PARTIAL_TRAILING_IDLE_SEC", "0.4"))
+
+
+def partial_due(new_signal_bytes: int, since_partial_sec: float,
+                since_signal_sec: float) -> bool:
+    """Whether unseen speech warrants another live partial now."""
+    if new_signal_bytes <= 0 or since_partial_sec < PARTIAL_INTERVAL_SEC:
+        return False
+    return (new_signal_bytes >= PARTIAL_MIN_DELTA_BYTES
+            or since_signal_sec >= PARTIAL_TRAILING_IDLE_SEC)
+
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
 # sentences; the final pass still transcribes the full utterance.
@@ -1571,6 +1603,8 @@ def _join_text(prefix: str, suffix: str) -> str:
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(ws: WebSocket):
     await ws.accept()
+    evidence_started = time.monotonic()
+    evidence_first_partial = False
     log.info("WebSocket client connected")
 
     # Tail-first streaming transcription.
@@ -1604,9 +1638,13 @@ async def ws_transcribe(ws: WebSocket):
     last_partial_text = ""
     raw_signal_bytes = 0
     raw_signal_bytes_at_last_partial = 0
+    last_signal_time = time.monotonic()
     partials_emitted = 0   # count of non-empty partials sent this session
     native_stream_state = None
     partial_task = None
+    # The last incremental partial's decode: (stable_bytes, audio, text). When
+    # stop's tail is byte-identical, that decode IS the tail decode.
+    partial_decode = None
     closing = False
     loop = asyncio.get_event_loop()
     slog = SessionLogger("ws")
@@ -1630,6 +1668,16 @@ async def ws_transcribe(ws: WebSocket):
     asr_context = ""
 
     async def send_json(payload: dict) -> None:
+        nonlocal evidence_first_partial
+        message_type = payload.get("type")
+        if message_type == "partial" and payload.get("text") and not evidence_first_partial:
+            _asr_evidence.observe("first_partial_ms", (time.monotonic() - evidence_started) * 1000)
+            evidence_first_partial = True
+        elif message_type == "final":
+            _asr_evidence.observe("finalization_ms", (time.monotonic() - evidence_started) * 1000)
+            _asr_evidence.observe("failure", 0)
+        elif message_type == "error":
+            _asr_evidence.observe("failure", 1)
         async with send_lock:
             await ws.send_json(payload)
 
@@ -1906,11 +1954,25 @@ async def ws_transcribe(ws: WebSocket):
 
                 pending_audio.clear()
 
-    def partial_snapshot() -> bytes:
+    def partial_snapshot():
+        """Audio for the next partial, and the stable prefix it continues.
+
+        Incremental when it can be: the stable prefix is already decoded, so a
+        partial decodes only the accepted speech after it — the same bytes stop
+        will decode — and shows prefix + tail. The text then always runs from
+        the start of the utterance. The 20 s sliding window re-transcribed its
+        overlap differently each time ("QW. QW E and ASR" vs "QWEN ASR"), which
+        the client could not reconcile, so long dictations showed sentences
+        repeated in the draft. The window remains the fallback for a tail too
+        long to decode per partial (stable commits kept coming back empty).
+        """
+        tail = bytes(gated_audio[stable_bytes:]) + bytes(pending_audio)
+        if len(tail) <= PARTIAL_WINDOW_BYTES:
+            return tail, stable_bytes, stable_text
         buf = raw_partial_audio if raw_partial_audio else partial_audio
         if len(buf) > PARTIAL_WINDOW_BYTES:
-            return bytes(buf[-PARTIAL_WINDOW_BYTES:])
-        return bytes(buf)
+            return bytes(buf[-PARTIAL_WINDOW_BYTES:]), None, ""
+        return bytes(buf), None, ""
 
     async def transcribe_partial(buf: bytes) -> str:
         """Transcribe the last N seconds of audio for live partials.
@@ -1924,8 +1986,9 @@ async def ws_transcribe(ws: WebSocket):
         ).strip()
         return text
 
-    async def run_partial(buf: bytes, signal_snapshot: int) -> None:
-        nonlocal last_partial_time, last_partial_text
+    async def run_partial(buf: bytes, signal_snapshot: int,
+                          prefix_bytes=None, prefix_text: str = "") -> None:
+        nonlocal last_partial_time, last_partial_text, partial_decode
         nonlocal raw_signal_bytes_at_last_partial
         audio_sec = len(buf) / BYTES_PER_SEC
         slog.event("partial_begin", {
@@ -1934,6 +1997,9 @@ async def ws_transcribe(ws: WebSocket):
         })
         try:
             text = await transcribe_partial(buf)
+            if prefix_bytes is not None:
+                partial_decode = (prefix_bytes, buf, text)
+                text = join_transcript(prefix_text, text)
             if closing:
                 slog.event("partial_suppressed", {"reason": "closing"})
                 return
@@ -2044,12 +2110,28 @@ async def ws_transcribe(ws: WebSocket):
                 await commit_task
             except Exception:
                 log.exception("Stable prefix commit failed before final")
+        if partial_task is not None and not partial_task.done():
+            # It holds the model lock, so the tail decode would wait for it
+            # anyway — and it may have decoded exactly the tail.
+            try:
+                await partial_task
+            except Exception:
+                log.exception("Partial transcription failed before final")
         tail = bytes(gated_audio[stable_bytes:])
         tail_text = ""
+        reused = (
+            partial_decode is not None
+            and partial_decode[0] == stable_bytes
+            and partial_decode[1] == tail
+        )
         # No length floor: the tail is the end of the utterance and a floor here
         # silently drops a short last word. The decoder is the judge of whether
         # there are words in it.
-        if tail:
+        if reused:
+            # Same bytes, same context, same model: the partial's decode is the
+            # tail decode, so the final covers exactly what it would have.
+            tail_text = partial_decode[2]
+        elif tail:
             tail_text = (
                 await _transcribe_buffer(bytearray(tail), context=asr_context)
                 or ""
@@ -2060,6 +2142,7 @@ async def ws_transcribe(ws: WebSocket):
                 "stable_sec": stable_bytes / BYTES_PER_SEC,
                 "tail_sec": len(tail) / BYTES_PER_SEC,
                 "reused_stable": bool(stable_text),
+                "reused_partial_decode": reused,
             })
             return final_text, recognized_frontier()
         # Short commands can fall below the VAD commit threshold, leaving
@@ -2091,18 +2174,17 @@ async def ws_transcribe(ws: WebSocket):
 
         now = time.monotonic()
         new_signal_bytes = raw_signal_bytes - raw_signal_bytes_at_last_partial
-        if new_signal_bytes < PARTIAL_MIN_DELTA_BYTES:
+        if not partial_due(new_signal_bytes, now - last_partial_time,
+                           now - last_signal_time):
             return
 
-        if now - last_partial_time < PARTIAL_INTERVAL_SEC:
-            return
-
-        buf = partial_snapshot()
+        buf, prefix_bytes, prefix_text = partial_snapshot()
         if len(buf) < int(BYTES_PER_SEC * 0.3):
             return
 
         signal_snapshot = raw_signal_bytes
-        partial_task = asyncio.create_task(run_partial(buf, signal_snapshot))
+        partial_task = asyncio.create_task(
+            run_partial(buf, signal_snapshot, prefix_bytes, prefix_text))
         partial_task.add_done_callback(observe_partial_task)
 
     try:
@@ -2156,6 +2238,7 @@ async def ws_transcribe(ws: WebSocket):
                 if pcm_has_signal(audio_bytes):
                     raw_partial_audio.extend(audio_bytes)
                     raw_signal_bytes += len(audio_bytes)
+                    last_signal_time = time.monotonic()
                 staging.extend(audio_bytes)
                 events = _process_staged_audio(staging, prev_window, gate_state)
                 await apply_events(events)
