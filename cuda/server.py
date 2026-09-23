@@ -1340,6 +1340,21 @@ PARTIAL_INTERVAL_SEC = float(_env("PARTIAL_INTERVAL_SEC", "0.6"))
 PARTIAL_MIN_DELTA_SEC = float(_env("PARTIAL_MIN_DELTA_SEC", "0.5"))
 PARTIAL_MIN_DELTA_BYTES = int(PARTIAL_MIN_DELTA_SEC * BYTES_PER_SEC)
 
+# Once the speaker goes quiet, a smaller remainder is still owed a partial. The
+# minimum above only ever advances on NEW sound, so trailing words worth less
+# than PARTIAL_MIN_DELTA_SEC of signal, followed by silence, were never shown:
+# the last partial sat on screen short of the utterance until the final.
+PARTIAL_TRAILING_IDLE_SEC = float(_env("PARTIAL_TRAILING_IDLE_SEC", "0.4"))
+
+
+def partial_due(new_signal_bytes: int, since_partial_sec: float,
+                since_signal_sec: float) -> bool:
+    """Whether unseen speech warrants another live partial now."""
+    if new_signal_bytes <= 0 or since_partial_sec < PARTIAL_INTERVAL_SEC:
+        return False
+    return (new_signal_bytes >= PARTIAL_MIN_DELTA_BYTES
+            or since_signal_sec >= PARTIAL_TRAILING_IDLE_SEC)
+
 # Sliding window for live partials.  The model re-transcribes the last N
 # seconds of audio on every partial tick.  20 s covers almost all natural
 # sentences; the final pass still transcribes the full utterance.
@@ -1561,6 +1576,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
     last_partial_text = ""
     raw_signal_bytes = 0
     raw_signal_bytes_at_last_partial = 0
+    last_signal_time = time.monotonic()
     native_stream_state = None
     partial_task = None
     closing = False
@@ -2055,10 +2071,8 @@ async def _ws_transcribe_impl(ws: WebSocket):
             return
         now = time.monotonic()
         new_signal_bytes = raw_signal_bytes - raw_signal_bytes_at_last_partial
-        if new_signal_bytes < PARTIAL_MIN_DELTA_BYTES:
-            return
-
-        if now - last_partial_time < PARTIAL_INTERVAL_SEC:
+        if not partial_due(new_signal_bytes, now - last_partial_time,
+                           now - last_signal_time):
             return
 
         buf = partial_snapshot()
@@ -2120,6 +2134,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 if pcm_has_signal(audio_bytes):
                     raw_partial_audio.extend(audio_bytes)
                     raw_signal_bytes += len(audio_bytes)
+                    last_signal_time = time.monotonic()
                 staging.extend(audio_bytes)
                 events = _process_staged_audio(staging, prev_window, gate_state)
                 await apply_events(events)
