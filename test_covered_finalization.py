@@ -297,6 +297,79 @@ def test_repeated_stop_is_answered_from_the_cache(client, decoder):
     )
 
 
+def test_a_reconnect_mid_dictation_keeps_full_coverage(client, decoder):
+    """Socket drops mid-dictation, the client resumes and finishes normally.
+
+    The coverage ledger lived on the connection, so the resumed one could only
+    vouch for bytes it carried itself: the final read as uncovered and the
+    client re-uploaded the whole recording after every relay hiccup.
+    """
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-reconnect")
+        seq = send_utterance(ws, seconds=3)
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_text(json.dumps({
+            "type": "resume",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "control": 2,
+            "sessionId": "sess-reconnect",
+        }))
+        json.loads(ws.receive_text())
+        seq = send_utterance(ws, seconds=2, start_seq=seq)
+        ws.send_text(json.dumps({
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-reconnect",
+            "stopId": "sess-reconnect-stop-1",
+            "finalCapturedSeq": seq,
+        }))
+        final = drain_until(ws, "final")
+
+    assert final["recognizedThroughSeq"] == seq
+
+
+def test_a_short_cached_final_is_refinalized_not_replayed(client, decoder):
+    """Stop arrived before the last frames; the reissue after resume must cover them.
+
+    The first final is honestly uncovered (audio still in flight). Replaying it
+    from the cache on the reissue handed the client the same short answer, and
+    the client's only move left was re-uploading the whole WAV.
+    """
+    missing = 5
+    with client.websocket_connect("/ws/transcribe") as ws:
+        start(ws, "sess-short-cache")
+        seq = send_utterance(ws, seconds=3)
+        captured = seq + missing  # the client holds frames the server never got
+        stop = {
+            "type": "stop",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "sessionId": "sess-short-cache",
+            "stopId": "sess-short-cache-stop-1",
+            "finalCapturedSeq": captured,
+        }
+        ws.send_text(json.dumps(stop))
+        first = drain_until(ws, "final")
+    assert first.get("recognizedThroughSeq") is None, "first final must be uncovered"
+
+    with client.websocket_connect("/ws/transcribe") as ws:
+        ws.send_text(json.dumps({
+            "type": "resume",
+            "protocol": server.ASR_PROTOCOL_VERSION,
+            "control": 2,
+            "sessionId": "sess-short-cache",
+        }))
+        json.loads(ws.receive_text())
+        for i in range(missing):
+            ws.send_bytes(audio_frame(seq + i, speech(CHUNK_BYTES)))
+        ws.send_text(json.dumps(stop))
+        second = drain_until(ws, "final")
+
+    assert second["recognizedThroughSeq"] == captured, (
+        "the reissue replayed the short cached final instead of finalizing "
+        "over the audio the resume delivered"
+    )
+
+
 def test_expired_stop_is_explicit_not_a_silent_redo(client, decoder, monkeypatch):
     monkeypatch.setattr(server, "ASR_STOP_RESULT_TTL_SEC", 0.0)
     with client.websocket_connect("/ws/transcribe") as ws:
