@@ -2,8 +2,10 @@
 Description=polyasr server (CUDA / Qwen3-ASR + forced aligner)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
+# Never give up restarting. A start limit turned a transient boot-time VRAM
+# race into a 16-hour outage on 2026-09-27 (three failures in five minutes,
+# then systemd stopped trying). Restarts back off instead: 30s growing to 10min.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -53,6 +55,8 @@ ExecStartPre=__REPO__/cuda/venv/bin/python __REPO__/cuda/runtime_preflight.py
 ExecStart=__REPO__/cuda/venv/bin/python __REPO__/cuda/server.py
 Restart=on-failure
 RestartSec=30
+RestartSteps=5
+RestartMaxDelaySec=600
 StandardOutput=append:__LOG_DIR__/polyasr.log
 StandardError=append:__LOG_DIR__/polyasr.err
 

@@ -925,12 +925,20 @@ async def startup_event():
     if LOG_DIR is not None:
         prune_log_storage(LOG_DIR)
     log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
-    with _transcribe_lock:
-        get_session()
-    backend_controller.active = _asr_settings()["backend"]
+    # A failed preload does not exit: the process stays up with /health 503 and
+    # the config loop retries the activation with backoff (see
+    # RETRY_FIRST_SECONDS in backend_config.py for the boot-time VRAM race).
+    try:
+        with _transcribe_lock:
+            get_session()
+    except Exception as exc:
+        backend_controller.record_activation_failure(_asr_settings()["backend"], exc)
+    else:
+        backend_controller.active = _asr_settings()["backend"]
     asyncio.create_task(_idle_evict_loop())
     asyncio.create_task(_backend_config_loop())
-    log.info("Server ready.")
+    log.info("Server ready%s.", "" if backend_controller.active else
+             " (ASR model NOT loaded; retrying)")
 
 
 @app.on_event("shutdown")
