@@ -10,11 +10,21 @@ import copy
 import hashlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 log = logging.getLogger('polyasr-config')
 MAX_CONFIG_BYTES = 16384
+# A failed activation is retried, not left for a config edit that never comes.
+# The common cause is transient: at boot every GPU workload loads at once, and
+# vLLM charges memory other processes allocate during its profiling window to
+# its own budget ("Available KV cache memory: -10.52 GiB"), so the first
+# attempts fail and a later one fits. 2026-09-27 on xc-tower-ubuntu the process
+# exited instead, systemd's start limit gave up after three tries, and the
+# engine stayed down for 16 hours while /health was unreachable.
+RETRY_FIRST_SECONDS = 15.0
+RETRY_MAX_SECONDS = 300.0
 DEFAULTS = {
     'backend': 'qwen',
     'qwen': {'model': 'Qwen/Qwen3-ASR-1.7B',
@@ -113,8 +123,11 @@ def context_text(value, settings):
 
 
 class BackendController:
-    def __init__(self, path, fallback=None):
+    def __init__(self, path, fallback=None, clock=time.monotonic):
         self.path = Path(path)
+        self.clock = clock
+        self.retry_at = None
+        self.retry_delay = RETRY_FIRST_SECONDS
         self.fallback = fallback
         self.current, self.fingerprint = read_config(path, fallback)
         self.desired = self.current
@@ -128,7 +141,18 @@ class BackendController:
     def status(self):
         return {'config_file': str(self.path), 'desired': self.desired['backend'],
                 'active': self.active, 'pending': self.pending,
-                'error': self.error, 'active_requests': self.requests}
+                'error': self.error, 'active_requests': self.requests,
+                'retry_in_seconds': (None if self.retry_at is None else
+                                     max(0.0, round(self.retry_at - self.clock(), 1)))}
+
+    def record_activation_failure(self, backend, exc):
+        """Mark the backend failed (so /health is 503 and requests are refused)
+        and schedule a retry with exponential backoff."""
+        self.error = f'{backend} activation failed: {type(exc).__name__}: {exc}'
+        self.failed_activation = True
+        self.retry_at = self.clock() + self.retry_delay
+        log.exception('%s; retrying in %.0fs', self.error, self.retry_delay)
+        self.retry_delay = min(self.retry_delay * 2, RETRY_MAX_SECONDS)
 
     @asynccontextmanager
     async def request(self):
@@ -159,6 +183,9 @@ class BackendController:
             self.error = None
         elif self.error and not self.failed_activation:
             self.error = None
+        if (self.failed_activation and not self.pending
+                and self.retry_at is not None and self.clock() >= self.retry_at):
+            self.pending = True
         if not self.pending:
             return
         async with self.gate:
@@ -170,13 +197,13 @@ class BackendController:
             try:
                 await asyncio.to_thread(activate)
             except Exception as exc:
-                self.error = f'{candidate["backend"]} activation failed: {type(exc).__name__}: {exc}'
-                self.failed_activation = True
-                log.exception(self.error)
+                self.record_activation_failure(candidate['backend'], exc)
             else:
                 self.active = candidate['backend']
                 self.failed_activation = False
                 self.error = None
+                self.retry_at = None
+                self.retry_delay = RETRY_FIRST_SECONDS
                 log.info('ASR backend active: %s; config=%s', self.active, self.path)
             self.pending = False
 

@@ -95,3 +95,40 @@ def test_context_is_typed_and_bounded():
         context_text("hints", settings)
     with pytest.raises(ValueError, match="string"):
         context_text(["hint"], settings)
+
+
+def test_failed_activation_retries_with_backoff_until_it_fits(tmp_path):
+    # Boot-time VRAM race: the first loads fail while other workloads are still
+    # loading, a later one fits. The controller must retry on its own, not wait
+    # for a config edit, and must refuse requests honestly until it succeeds.
+    async def scenario():
+        path = tmp_path / "asr.json"
+        write(path, {"backend": "r2t2"})
+        now = [0.0]
+        controller = BackendController(path, clock=lambda: now[0])
+        controller.record_activation_failure("r2t2", ValueError("-10.52 GiB"))
+        assert controller.status()["retry_in_seconds"] == 15.0
+        with pytest.raises(RuntimeError, match="activation failed"):
+            async with controller.request():
+                pass
+
+        attempts = []
+        def fail():
+            attempts.append(now[0])
+            raise ValueError("-3.87 GiB")
+        await controller.poll(lambda: False, fail)
+        assert attempts == []            # not before the backoff elapses
+        now[0] = 15.0
+        await controller.poll(lambda: False, fail)
+        assert attempts == [15.0]
+        assert controller.status()["retry_in_seconds"] == 30.0   # doubled
+
+        now[0] = 45.0
+        await controller.poll(lambda: False, lambda: None)
+        status = controller.status()
+        assert status["active"] == "r2t2"
+        assert status["error"] is None and status["retry_in_seconds"] is None
+        async with controller.request():
+            pass
+
+    asyncio.run(scenario())
