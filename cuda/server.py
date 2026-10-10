@@ -895,7 +895,7 @@ def _has_unfinished_sessions() -> bool:
     return any(session.final_text is None for session in _protocol_sessions.values())
 
 
-def _activate_configured_backend() -> None:
+def _activate_configured_backend_unfenced() -> None:
     if FAKE_TRANSCRIBE:
         return
     with _transcribe_lock:
@@ -912,6 +912,12 @@ def _activate_configured_backend() -> None:
                     or not _UNITS["asr"].loaded):
                 raise
             log.warning("ASR reload succeeded; coordinator has no on_degraded hook")
+
+
+def _activate_configured_backend() -> None:
+    if _provider_fence is not None:
+        return _provider_fence.run(_activate_configured_backend_unfenced, _synchronize_owned_alignment)
+    return _activate_configured_backend_unfenced()
 
 
 async def _backend_config_loop() -> None:
