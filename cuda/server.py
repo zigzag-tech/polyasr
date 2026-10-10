@@ -34,6 +34,7 @@ import logging
 import wave
 import contextlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,8 @@ from asr_backends import load_backend  # noqa: E402
 from backend_config import BackendController, DEFAULTS, context_text  # noqa: E402
 from log_storage import prune_log_storage  # noqa: E402
 from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
+from owned_alignment import AlignmentJobs  # noqa: E402
+from owned_alignment_api import build_owned_alignment_router  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -943,6 +946,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    # Drain only this owned executor before managed units may be unloaded.
+    await asyncio.get_event_loop().run_in_executor(None, lambda: _owned_alignment_executor.shutdown(wait=True, cancel_futures=True))
     if manager is None:
         return
     loop = asyncio.get_event_loop()
@@ -1096,7 +1101,17 @@ async def _transcribe_impl(file, model, language, context, response_format):
 # ---------------------------------------------------------------------------
 # Forced-alignment endpoint (port of unchain scripts/python/qwen3_asr.py)
 # ---------------------------------------------------------------------------
-def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int) -> dict:
+@contextlib.contextmanager
+def _owned_align_scope(cancel):
+    # Called only after the existing model lock is acquired. A cancelled queued
+    # job cannot load a model while it waits behind another user's inference.
+    if cancel is not None:
+        cancel.check()
+    with manager.run_scope("align") as model:
+        yield model
+
+
+def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int, cancel=None) -> dict:
     """Align one local audio file (chunked ≤ max_chunk_seconds) and return
     {text, language, segments} (NO 'model' key — callers add it). Runs on a
     worker thread while holding _transcribe_lock (load + per-chunk transcribe
@@ -1107,16 +1122,22 @@ def align_local_path(path: Path, language: Optional[str], max_chunk_seconds: int
     detected_language: Optional[str] = None
     norm = polyasr_align.normalize_language(language)
 
-    with _transcribe_lock, manager.run_scope("align") as model:
+    if cancel is not None:
+        cancel.check()
+    with _transcribe_lock, _owned_align_scope(cancel) as model:
         for chunk_idx, offset, chunk_path in polyasr_align.load_audio_chunks(
             audio_path, max_chunk_seconds
         ):
+            if cancel is not None:
+                cancel.check()
             log.info("align chunk %d: offset=%.1fs file=%s",
                      chunk_idx, offset, chunk_path.name)
             kwargs = {"audio": str(chunk_path), "return_time_stamps": True}
             if norm:
                 kwargs["language"] = norm
             results = model.transcribe(**kwargs)
+            if cancel is not None:
+                cancel.check()
             if not results:
                 continue
             r = results[0]
@@ -1179,7 +1200,7 @@ def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
 
 
 def _align_manifest(items: list[dict], language: Optional[str],
-                    max_chunk_seconds: int) -> dict:
+                    max_chunk_seconds: int, cancel=None) -> dict:
     """Align each manifest entry's local audio, offset its timings by the
     entry's `offset`, and concatenate text + segments across entries in order.
     Returns one combined {text, language, segments}. Runs on a worker thread."""
@@ -1187,9 +1208,11 @@ def _align_manifest(items: list[dict], language: Optional[str],
     merged_segments: list[dict] = []
     detected_language: Optional[str] = None
     for idx, item in enumerate(items):
+        if cancel is not None:
+            cancel.check()
         offset = float(item.get("offset", 0.0))
         try:
-            one = align_local_path(item["_path"], language, max_chunk_seconds)
+            one = align_local_path(item["_path"], language, max_chunk_seconds, cancel)
         except Exception as e:
             entry_id = item.get("id", idx)
             raise RuntimeError(f"align failed for manifest entry {entry_id} "
@@ -1203,6 +1226,35 @@ def _align_manifest(items: list[dict], language: Optional[str],
         "language": detected_language or language or "auto",
         "segments": merged_segments,
     }
+
+
+def _synchronize_owned_alignment():
+    # Returning a Python Future does not prove pending CUDA kernels have stopped.
+    # Serialize the synchronization barrier with all existing model operations.
+    with _transcribe_lock:
+        if DEVICE.startswith('cuda'):
+            import torch
+            torch.cuda.synchronize(DEVICE)
+
+
+def _owned_alignment_capability():
+    # No inference or model load occurs during a capability read.
+    from importlib.util import find_spec
+    supported = DEVICE.startswith('cuda') and find_spec('torch') is not None and find_spec('qwen_asr') is not None
+    return {'physical_cancellation': {'supported': supported, 'scope': ['alignment'],
+            'mechanism': 'cooperative-chunk-boundary-plus-executor-and-cuda-synchronize', 'bounded_latency': False}}
+
+
+def _run_owned_alignment(path, request, signal):
+    with _in_flight():
+        result = align_local_path(path, request.get('language'), request.get('max_chunk_seconds', 270), signal)
+        result['model'] = _ALIGN_MODEL_LABEL
+        return result
+
+
+_owned_alignment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='owned-alignment')
+_owned_alignment_jobs = AlignmentJobs(_owned_alignment_executor, _synchronize_owned_alignment)
+app.include_router(build_owned_alignment_router(_owned_alignment_jobs, _run_owned_alignment, _owned_alignment_capability))
 
 
 @app.post("/v1/align")
