@@ -1241,7 +1241,7 @@ def _owned_alignment_capability():
     # No inference or model load occurs during a capability read.
     from importlib.util import find_spec
     supported = DEVICE.startswith('cuda') and find_spec('torch') is not None and find_spec('qwen_asr') is not None
-    return {'physical_cancellation': {'supported': supported, 'scope': ['alignment'],
+    return {'unit': 'align', 'model': _ALIGN_MODEL_LABEL, 'physical_cancellation': {'supported': supported, 'scope': ['alignment'],
             'mechanism': 'cooperative-chunk-boundary-plus-executor-and-cuda-synchronize', 'bounded_latency': False}}
 
 
