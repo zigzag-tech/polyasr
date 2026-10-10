@@ -779,7 +779,7 @@ async def feed_native_stream(state, pcm_data: bytes) -> str:
         with _transcribe_lock:
             return get_session().feed_stream(state, pcm)
 
-    return (await loop.run_in_executor(None, run_feed) or "").strip()
+    return (await loop.run_in_executor(_legacy_executor, run_feed) or "").strip()
 
 
 async def finish_native_stream(state) -> str:
@@ -791,7 +791,7 @@ async def finish_native_stream(state) -> str:
         with _transcribe_lock:
             return get_session().finish_stream(state)
 
-    return (await loop.run_in_executor(None, run_finish) or "").strip()
+    return (await loop.run_in_executor(_legacy_executor, run_finish) or "").strip()
 
 
 def _flatten_result_text(result) -> str:
@@ -821,12 +821,18 @@ def _flatten_result_language(result) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (CUDA)", version="2.0.0")
+_legacy_executor = None
+_provider_fence = None
 
 
 def _gpu_call(fn):
     """Run a thunk under the GPU lock (warm/evict from the /livestack facade)."""
-    with _transcribe_lock:
-        return fn()
+    def invoke():
+        with _transcribe_lock:
+            return fn()
+    if _provider_fence is not None:
+        return _provider_fence.run(invoke, _synchronize_owned_alignment)
+    return invoke()
 
 
 # Wire the polycore manager + residency. With livestack present this becomes a
@@ -879,7 +885,7 @@ async def _idle_evict_loop():
     while True:
         await asyncio.sleep(10)
         try:
-            await loop.run_in_executor(None, sweep)
+            await loop.run_in_executor(_legacy_executor, sweep)
         except Exception:
             log.exception("idle-evict sweep failed")
 
@@ -947,14 +953,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     # Drain only this owned executor before managed units may be unloaded.
-    await asyncio.get_event_loop().run_in_executor(None, lambda: _owned_alignment_executor.shutdown(wait=True, cancel_futures=True))
+    await asyncio.get_event_loop().run_in_executor(_legacy_executor, lambda: _owned_alignment_executor.shutdown(wait=True, cancel_futures=True))
     if manager is None:
         return
     loop = asyncio.get_event_loop()
     def unload():
         with _transcribe_lock:
             return manager.unload_now()
-    await loop.run_in_executor(None, unload)
+    await loop.run_in_executor(_legacy_executor, unload)
     log.info("Server shutdown released managed model executors.")
 
 
@@ -994,7 +1000,7 @@ async def model_unload():
         with _transcribe_lock:
             return manager.unload_now()
 
-    evicted = await loop.run_in_executor(None, do_unload)
+    evicted = await loop.run_in_executor(_legacy_executor, do_unload)
     return {"unloaded": evicted, "manager": manager.status()}
 
 
@@ -1062,7 +1068,7 @@ async def _transcribe_impl(file, model, language, context, response_format):
             with _transcribe_lock:
                 return get_session().transcribe(**kwargs)
 
-        result = await loop.run_in_executor(None, run_transcribe)
+        result = await loop.run_in_executor(_legacy_executor, run_transcribe)
         text = _flatten_result_text(result)
         lang = _flatten_result_language(result)
 
@@ -1255,6 +1261,29 @@ def _run_owned_alignment(path, request, signal):
 _owned_alignment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='owned-alignment')
 _owned_alignment_jobs = AlignmentJobs(_owned_alignment_executor, _synchronize_owned_alignment)
 app.include_router(build_owned_alignment_router(_owned_alignment_jobs, _run_owned_alignment, _owned_alignment_capability))
+
+
+def configure_provider_fence(authorize_operator, source_identity):
+    """Trusted owner bootstrap before startup; existing standalone path retained."""
+    global _legacy_executor, _owned_alignment_executor, _provider_fence
+    import re
+    from livestack_node.provider_fence import ProviderFence, install_provider_fence
+    if _provider_fence is not None:
+        raise RuntimeError('provider_fence_already_configured')
+    fence = ProviderFence(authorize_operator)
+    def bypass(scope):
+        path, method = scope['path'], scope.get('method')
+        if method == 'GET' and path in ('/health', '/v1/align/capabilities'):
+            return True
+        return bool(re.fullmatch(r'/v1/align/jobs/[A-Za-z0-9-]+(?:/result)?', path) and method == 'GET'
+            or re.fullmatch(r'/v1/align/jobs/[A-Za-z0-9-]+/cancel', path) and method == 'POST')
+    install_provider_fence(app, fence, bypass, source_identity)
+    _legacy_executor = fence.executor(ThreadPoolExecutor(thread_name_prefix='fenced-legacy-asr'), _synchronize_owned_alignment)
+    _owned_alignment_executor = fence.executor(_owned_alignment_executor, _synchronize_owned_alignment)
+    _owned_alignment_jobs._executor = _owned_alignment_executor
+    _provider_fence = fence
+    return fence
+
 
 
 @app.post("/v1/align")
@@ -2621,7 +2650,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
     finally:
         try:
             closing = True
-            await loop.run_in_executor(None, slog.close)
+            await loop.run_in_executor(_legacy_executor, slog.close)
         except Exception:
             log.exception("Session logger close failed")
 
@@ -2648,7 +2677,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
             with _transcribe_lock:
                 return get_session().transcribe(**kwargs)
 
-        result = await loop.run_in_executor(None, run_transcribe)
+        result = await loop.run_in_executor(_legacy_executor, run_transcribe)
         return _flatten_result_text(result)
     except Exception:
         log.exception("Transcription error")
