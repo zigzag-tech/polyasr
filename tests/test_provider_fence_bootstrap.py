@@ -13,6 +13,9 @@ class BootstrapTests(unittest.TestCase):
     def test_owner_bootstrap_actual_asgi_and_executor_adapters(self):
         root = Path(__file__).resolve().parents[1]
         tree = ast.parse((root / 'cuda/server.py').read_text())
+        for call in ast.walk(tree):
+            if isinstance(call,ast.Call) and isinstance(call.func,ast.Attribute) and call.func.attr == 'run_in_executor':
+                self.assertFalse(isinstance(call.args[0],ast.Constant) and call.args[0].value is None, 'untracked default executor')
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'configure_provider_fence')
         app = FastAPI()
         @app.post('/legacy')

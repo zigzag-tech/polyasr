@@ -1307,7 +1307,7 @@ async def align(
         loop = asyncio.get_event_loop()
         t0 = time.monotonic()
         result = await loop.run_in_executor(
-            None, align_local_path, Path(tmp.name), language, int(max_chunk_seconds)
+            _legacy_executor, align_local_path, Path(tmp.name), language, int(max_chunk_seconds)
         )
         result["model"] = _ALIGN_MODEL_LABEL
         log.info("Aligned in %.2fs: %d segments, %d chars",
@@ -1361,7 +1361,7 @@ async def diarize(
         loop = asyncio.get_event_loop()
         t0 = time.monotonic()
         result = await loop.run_in_executor(
-            None, diarize_local_path, Path(tmp.name),
+            _legacy_executor, diarize_local_path, Path(tmp.name),
             num_speakers, min_speakers, max_speakers,
         )
         result["model"] = polyasr_diarize.DEFAULT_MODEL
@@ -1413,7 +1413,7 @@ async def align_manifest(payload: dict = Body(...)):
     t0 = time.monotonic()
     try:
         result = await loop.run_in_executor(
-            None, _align_manifest, items, language, max_chunk_seconds
+            _legacy_executor, _align_manifest, items, language, max_chunk_seconds
         )
     except Exception as e:
         log.exception("Manifest alignment failed")
@@ -1953,7 +1953,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                 # Speaker check (off-thread — embedding takes ~30-50ms).
                 chunk_bytes = bytes(pending_audio)
                 embedding = await loop.run_in_executor(
-                    None, compute_embedding, chunk_bytes)
+                    _legacy_executor, compute_embedding, chunk_bytes)
 
                 accept = True
                 sim_val = None
@@ -2576,7 +2576,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                         sim_val = None
                         if reference_embedding is not None:
                             emb = await loop.run_in_executor(
-                                None, compute_embedding, chunk_bytes)
+                                _legacy_executor, compute_embedding, chunk_bytes)
                             if emb is not None:
                                 sim_val = cosine_sim(emb, reference_embedding)
                                 if sim_val < SPEAKER_SIM_THRESHOLD:
