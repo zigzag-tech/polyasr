@@ -115,6 +115,7 @@ IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
 COLOAD = _envflag("COLOAD", "1")
 ASR_FINAL_WAIT_PARTIAL = _envflag("FINAL_WAIT_PARTIAL", "0")
 ASR_PARTIALS_ENABLED = _envflag("PARTIALS_ENABLED", "1")
+QUALIFICATION_ONLY = os.environ.get("POLYASR_QUALIFICATION_ONLY", "0") == "1"
 FAKE_TRANSCRIBE = _env("FAKE_TRANSCRIBE", "").lower() in {"1", "true", "yes"}
 FAKE_TRANSCRIBE_DELAY_SEC = float(_env("FAKE_TRANSCRIBE_DELAY_SEC", "0.0"))
 _vad_model = None
@@ -926,6 +927,8 @@ async def _backend_config_loop() -> None:
 
 @app.on_event("startup")
 async def startup_event():
+    if QUALIFICATION_ONLY:
+        return
     if FAKE_TRANSCRIBE:
         backend_controller.active = _asr_settings()["backend"]
         asyncio.create_task(_backend_config_loop())
