@@ -1,6 +1,7 @@
 """CPU source wiring controls; no full-server/model qualification."""
 import ast
 import asyncio
+import hashlib
 from pathlib import Path
 import unittest
 
@@ -22,7 +23,10 @@ class QualificationStartupTests(unittest.TestCase):
         self.assertEqual(ast.dump(guard.test), "Name(id='QUALIFICATION_ONLY', ctx=Load())")
         self.assertEqual(len(guard.body), 1)
         self.assertIsInstance(guard.body[0], ast.Return)
-        self.assertGreater(len(startup.body), 3)
+        retained = [node for node in startup.body if node is not guard]
+        digest = hashlib.sha256(ast.dump(ast.Module(body=retained, type_ignores=[]), include_attributes=False).encode()).hexdigest()
+        # Retained original startup AST before adding the qualification guard.
+        self.assertEqual(digest, '5953cc357b1876c3f072be5e7a6e9e5bae7f211e9a4d67765e9066219eeafa56')
 
 if __name__ == "__main__":
     unittest.main()
