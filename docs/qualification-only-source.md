@@ -42,3 +42,6 @@ owned input creation, accepted results after revocation, isolated CLI Unicode/or
 controls and unchanged startup. It does not qualify full server imports, real
 canonical operator onboarding, models, actual GPU/node leases, real backend
 cancellation or an installed source/environment/seal/config tuple.
+
+
+The isolated qualification source branch now pins Livestack5461022b82dbe7281bdf93aa7ac5f235d5fcc859. Its exact independently fetched Python and Rust wheels passed installed import closure and32 CPU node controls. Both owners' original-startup/bootstrap suites passed15 controls in distinct subprocesses against that installed wheel. This source-only lock preserves production/main and historicalaf tuples; it does not qualify a CUDA environment, model effects, registered grants or eligible capacity. Evidence: `/home/ubuntu/.local/tmp/provider-owned/qualification-final-source-qmrn1l5c/owner-installed-framework-cpu.log`.
