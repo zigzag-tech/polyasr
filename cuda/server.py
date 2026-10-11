@@ -822,6 +822,9 @@ def _flatten_result_language(result) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (CUDA)", version="2.0.0")
+if QUALIFICATION_ONLY:
+    from livestack_node.qualification_ingress import QualificationIngress
+    app.add_middleware(QualificationIngress, provider='polyasr')
 _legacy_executor = None
 _provider_fence = None
 
@@ -1269,7 +1272,35 @@ def _run_owned_alignment(path, request, signal):
 
 _owned_alignment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='owned-alignment')
 _owned_alignment_jobs = AlignmentJobs(_owned_alignment_executor, _synchronize_owned_alignment)
-app.include_router(build_owned_alignment_router(_owned_alignment_jobs, _run_owned_alignment, _owned_alignment_capability))
+def configure_provider_qualification(gate):
+    """Source-bound installed bootstrap supplies the registered exact node gate."""
+    from livestack_node.qualification_node import QualificationNodeGate
+    if not QUALIFICATION_ONLY or manager is None or not isinstance(gate, QualificationNodeGate) or gate.manager is not manager or getattr(app.state, 'qualification_gate', None) is not None:
+        raise RuntimeError('qualification_owned_alignment_gate_required')
+    app.state.qualification_gate = gate
+
+
+def _authorize_owned_qualification(parsed, fingerprint, authorization):
+    if not QUALIFICATION_ONLY:
+        return None
+    gate = getattr(app.state, 'qualification_gate', None)
+    if gate is None:
+        raise HTTPException(503, 'qualification owner bootstrap absent')
+    if parsed['request'].get('language') not in ('en','English'):
+        raise PermissionError('explicit English alignment qualification input required')
+    job = {'jobId':parsed['job_id'],'ownerId':parsed['owner_id'],'inputDigest':fingerprint,'modelKind':'asr'}
+    receipt = gate.admit(job,authorization)
+    def wrap(worker):
+        def physical_worker(signal):
+            signal.check()
+            with gate.work(job,authorization,receipt['fence']):
+                return worker(signal)
+        return physical_worker
+    return wrap
+
+
+app.include_router(build_owned_alignment_router(_owned_alignment_jobs, _run_owned_alignment, _owned_alignment_capability,
+    authorize=_authorize_owned_qualification))
 
 
 def configure_provider_fence(authorize_operator, source_identity):

@@ -1,4 +1,5 @@
 """Upload-only owned ASR control API; old synchronous endpoints are unchanged."""
+import asyncio
 import hashlib
 import json
 import tempfile
@@ -8,7 +9,7 @@ from fastapi import APIRouter, Body, File, Form, Header, HTTPException, UploadFi
 from owned_alignment import JobCapacity, JobConflict, alignment_digest
 
 
-def build_owned_alignment_router(jobs, runner, capability):
+def build_owned_alignment_router(jobs, runner, capability, *, authorize=None):
     router = APIRouter()
 
     def token(authorization):
@@ -35,7 +36,7 @@ def build_owned_alignment_router(jobs, runner, capability):
                 'transports': ['upload']}
 
     @router.post('/v1/align/jobs')
-    async def submit(submission: str = Form(...), file: UploadFile = File(...)):
+    async def submit(submission: str = Form(...), file: UploadFile = File(...), x_provider_qualification_authorization: str = Header(None)):
         if capability().get('physical_cancellation', {}).get('supported') is not True:
             raise HTTPException(503, 'owned alignment physical settlement unqualified')
         try:
@@ -60,6 +61,14 @@ def build_owned_alignment_router(jobs, runner, capability):
                 raise ValueError('audio snapshot mismatch')
         except (ValueError, TypeError, KeyError):
             raise HTTPException(400, 'invalid owned alignment submission')
+        wrapper = None
+        if authorize is not None:
+            try:
+                wrapper = await asyncio.to_thread(authorize,parsed,alignment_digest(request),x_provider_qualification_authorization)
+            except PermissionError:
+                raise HTTPException(403, 'qualification canonical alignment input refused')
+            except ValueError:
+                raise HTTPException(400, 'qualification alignment input binding refused')
         # Independent server-owned input survives the upload handler and client disconnect.
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as audio:
             audio.write(content)
@@ -67,6 +76,8 @@ def build_owned_alignment_router(jobs, runner, capability):
         def work(signal):
             signal.check()
             return runner(path, request, signal)
+        if wrapper is not None:
+            work = wrapper(work)
         cleanup = lambda: path.unlink(missing_ok=True)
         try:
             return invoke(lambda: jobs.submit(parsed['job_id'], parsed['owner_id'], parsed['control_token'],
