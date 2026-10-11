@@ -1264,8 +1264,14 @@ def _owned_alignment_capability():
     # No inference or model load occurs during a capability read.
     from importlib.util import find_spec
     supported = DEVICE.startswith('cuda') and find_spec('torch') is not None and find_spec('qwen_asr') is not None
-    return {'unit': 'align', 'model': _ALIGN_MODEL_LABEL, 'physical_cancellation': {'supported': supported, 'scope': ['alignment'],
+    capability = {'unit': 'align', 'model': _ALIGN_MODEL_LABEL, 'physical_cancellation': {'supported': supported, 'scope': ['alignment'],
             'mechanism': 'cooperative-chunk-boundary-plus-executor-and-cuda-synchronize', 'bounded_latency': False}}
+    if QUALIFICATION_ONLY:
+        gate = getattr(app.state, 'qualification_gate', None)
+        if gate is None:
+            raise HTTPException(503, 'qualification evidence capability bootstrap absent')
+        capability['qualification_evidence'] = {'version':1,'required':True,'binding':dict(gate.binding)}
+    return capability
 
 
 def _run_owned_alignment(path, request, signal):
@@ -1298,8 +1304,14 @@ def _authorize_owned_qualification(parsed, fingerprint, authorization):
     def wrap(worker):
         def physical_worker(signal):
             signal.check()
-            with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_alignment):
-                return worker(signal)
+            proof = None
+            try:
+                with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_alignment) as proof:
+                    signal.record_qualification_evidence({'version':1,'reservation':receipt,'residency':proof})
+                    return worker(signal)
+            finally:
+                if proof is not None:
+                    signal.record_qualification_evidence({'version':1,'reservation':receipt,'residency':proof})
         return physical_worker
     return wrap
 
