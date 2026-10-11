@@ -1252,6 +1252,8 @@ def _synchronize_owned_alignment():
     with _transcribe_lock:
         if DEVICE.startswith('cuda'):
             import torch
+            if QUALIFICATION_ONLY and not torch.cuda.is_initialized():
+                return
             torch.cuda.synchronize(DEVICE)
 
 
@@ -1293,7 +1295,7 @@ def _authorize_owned_qualification(parsed, fingerprint, authorization):
     def wrap(worker):
         def physical_worker(signal):
             signal.check()
-            with gate.work(job,authorization,receipt['fence']):
+            with gate.work(job,authorization,receipt['fence'],synchronize=_synchronize_owned_alignment):
                 return worker(signal)
         return physical_worker
     return wrap

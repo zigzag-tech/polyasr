@@ -24,7 +24,7 @@ class CudaAlignmentBoundaryTest(unittest.TestCase):
             group_chars_into_sentences=lambda _timings, _text: [])
         self.namespace = {'contextlib': contextlib, 'threading': threading, 'Optional': Optional, 'Path': Path,
             '_transcribe_lock': threading.Lock(), 'manager': types.SimpleNamespace(run_scope=scope),
-            'polyasr_align': helper, 'log': types.SimpleNamespace(info=lambda *_args: None), 'DEVICE': 'cuda:0'}
+            'polyasr_align': helper, 'log': types.SimpleNamespace(info=lambda *_args: None), 'DEVICE': 'cuda:0', 'QUALIFICATION_ONLY':False}
         source = ast.parse(Path('cuda/server.py').read_text())
         names = {'_owned_align_scope', 'align_local_path', '_synchronize_owned_alignment'}
         selected = ast.Module(body=[node for node in source.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names], type_ignores=[])
