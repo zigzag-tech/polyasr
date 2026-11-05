@@ -51,6 +51,7 @@ sibling [polytts](https://github.com/zigzag-tech/polytts) (text-to-speech).
 ├── requirements.txt                  # MLX dependencies
 ├── polyasr_manager.py                # shared one-model-in-VRAM idle-evict manager
 ├── polyasr_align.py                  # shared forced-alignment helpers (chunking + sentence grouping)
+├── polyasr_public_errors.py          # public client error vocabulary (code + generic message + request_id); detail only in logs
 ├── launchd/
 │   └── io.zigzag.polyasr.plist.template
 ├── deploy/

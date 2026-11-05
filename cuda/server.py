@@ -52,6 +52,7 @@ if _REPO_ROOT not in sys.path:
 
 from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
+import polyasr_public_errors as pub  # noqa: E402
 import polyasr_diarize  # noqa: E402
 from runtime_preflight import validate_pytorch_stack  # noqa: E402
 from asr_backends import load_backend  # noqa: E402
@@ -818,6 +819,7 @@ def _flatten_result_language(result) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (CUDA)", version="2.0.0")
+pub.install(app)
 
 
 def _gpu_call(fn):
@@ -953,6 +955,12 @@ async def shutdown_event():
     log.info("Server shutdown released managed model executors.")
 
 
+def _controller_refusal_code(exc: Exception) -> str:
+    """backend_controller.request() refuses with RuntimeError: a full session
+    table is rate_limited, anything else (failed activation) is unavailable."""
+    return "rate_limited" if "concurrent request limit" in str(exc) else "unavailable"
+
+
 @app.get("/health")
 async def health():
     gpu = None
@@ -968,12 +976,17 @@ async def health():
     except Exception:
         pass
     backend = backend_controller.status()
-    body = {"status": "error" if backend["error"] else "ok",
+    backend_failed = bool(backend["error"])
+    # Activation errors are exception text and config_file is a host path:
+    # clients get a code, the full text is already in the server log.
+    backend = {k: v for k, v in backend.items() if k != "config_file"}
+    backend["error"] = "activation_failed" if backend_failed else None
+    body = {"status": "error" if backend_failed else "ok",
             "model": _model_name(), "backend": "cuda",
             "asr_backend": backend, "dtype": DTYPE,
             "fake_transcribe": FAKE_TRANSCRIBE, "gpu": gpu,
             "manager": manager.status()}
-    return JSONResponse(body, status_code=503 if backend["error"] else 200)
+    return JSONResponse(body, status_code=503 if backend_failed else 200)
 
 
 @app.post("/model/unload")
@@ -1009,7 +1022,7 @@ async def transcribe(
             with _in_flight():
                 return await _transcribe_impl(file, model, language, context, response_format)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise pub.PublicError(_controller_refusal_code(exc), detail=repr(exc), status=503) from exc
 
 
 async def _transcribe_impl(file, model, language, context, response_format):
@@ -1017,7 +1030,7 @@ async def _transcribe_impl(file, model, language, context, response_format):
     try:
         context = context_text(context, _asr_settings())
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise pub.PublicError("bad_request", detail=repr(exc), status=422) from exc
     suffix = Path(file.filename).suffix if file.filename else ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
@@ -1085,7 +1098,7 @@ async def _transcribe_impl(file, model, language, context, response_format):
     except Exception as e:
         _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1234,7 +1247,7 @@ async def align(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Alignment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1290,7 +1303,7 @@ async def diarize(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Diarization failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1323,9 +1336,9 @@ async def align_manifest(payload: dict = Body(...)):
                                 detail=f"manifest entry {idx} missing 'path'")
         p = Path(str(entry["path"]))
         if not p.exists():
-            raise HTTPException(status_code=400,
-                                detail=f"manifest entry {entry.get('id', idx)} "
-                                       f"path not found: {p}")
+            raise pub.PublicError("bad_request",
+                                  detail=f"manifest entry {entry.get('id', idx)} "
+                                         f"path not found: {p}")
         items.append({**entry, "_path": p})
 
     loop = asyncio.get_event_loop()
@@ -1336,7 +1349,7 @@ async def align_manifest(payload: dict = Body(...)):
         )
     except Exception as e:
         log.exception("Manifest alignment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     result["model"] = _ALIGN_MODEL_LABEL
     log.info("Aligned manifest (%d entries) in %.2fs: %d segments, %d chars",
              len(items), time.monotonic() - t0,
@@ -1553,7 +1566,7 @@ async def ws_transcribe(ws: WebSocket):
                 await _ws_transcribe_impl(ws)
     except RuntimeError as exc:
         await ws.accept()
-        await ws.send_json({"type": "error", "error": str(exc)})
+        await ws.send_json(pub.ws_error(_controller_refusal_code(exc), pub.new_request_id(), detail=repr(exc)))
         await ws.close(code=1013)
 
 
@@ -2255,7 +2268,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
                             else context_text(msg.get("context"), _asr_settings())
                         )
                     except ValueError as exc:
-                        await send_json({"type": "error", "error": str(exc)})
+                        await send_json(pub.ws_error("bad_request", slog.session_id, detail=repr(exc)))
                         break
                     if msg_type == "resume" and protocol_session.context != requested_context:
                         await send_json({
@@ -2563,7 +2576,7 @@ async def _ws_transcribe_impl(ws: WebSocket):
         log.exception("WebSocket error: %s", e)
         slog.event("error", {"message": str(e)})
         try:
-            await send_json({"error": str(e)})
+            await send_json(pub.ws_error("internal", slog.session_id, detail=repr(e)))
         except Exception:
             pass
     finally:

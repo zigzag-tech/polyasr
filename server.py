@@ -45,6 +45,7 @@ if _REPO_ROOT not in sys.path:
 from livestack_node import (ModelManager as AsrModelManager, ManagedUnit, ResidencyPolicy,  # noqa: E402
                       counting, free_mlx, trim_ram)
 import polyasr_align  # noqa: E402
+import polyasr_public_errors as pub  # noqa: E402
 import polyasr_diarize  # noqa: E402
 from asr_evidence import AsrEvidence, inventory as evidence_inventory  # noqa: E402
 
@@ -899,6 +900,7 @@ async def finish_native_stream(state) -> str:
 
 # ---------------------------------------------------------------------------
 app = FastAPI(title="polyasr (MLX)", version="2.0.0")
+pub.install(app)
 
 
 def _gpu_call(fn):
@@ -1016,7 +1018,9 @@ async def health():
     return {
         "status": status,
         "reasons": reasons,
-        "cache_access_error": _cache_access_error,
+        # Free text names the cache path; clients get a code (full text is logged
+        # at startup / on each re-check).
+        "cache_access_error": "cache_unreachable" if _cache_access_error else None,
         "weights_present": weights_present,
         "model": MODEL_NAME,
         "memory_mb": {
@@ -1155,7 +1159,7 @@ async def transcribe(
         # 503, not 500: the node cannot serve at all (weights gone / unloadable),
         # so callers should route to another node rather than retry here.
         log.critical("ASR model unavailable (batch): %s", e)
-        raise HTTPException(status_code=503, detail=f"asr model unavailable: {e}")
+        raise pub.PublicError("model_unavailable", detail=f"asr model unavailable: {e}")
     except HTTPException:
         # Deliberate 4xx (empty/undecodable input): keep the status; the
         # catch-all below would otherwise re-map it to a retryable 500.
@@ -1163,7 +1167,7 @@ async def transcribe(
     except Exception as e:
         _asr_evidence.observe("failure", 1)
         log.exception("Transcription failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1340,7 +1344,7 @@ async def align(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Alignment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1399,7 +1403,7 @@ async def diarize(
         return JSONResponse(result)
     except Exception as e:
         log.exception("Diarization failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     finally:
         try:
             os.unlink(tmp.name)
@@ -1432,9 +1436,9 @@ async def align_manifest(payload: dict = Body(...)):
                                 detail=f"manifest entry {idx} missing 'path'")
         p = Path(str(entry["path"]))
         if not p.exists():
-            raise HTTPException(status_code=400,
-                                detail=f"manifest entry {entry.get('id', idx)} "
-                                       f"path not found: {p}")
+            raise pub.PublicError("bad_request",
+                                  detail=f"manifest entry {entry.get('id', idx)} "
+                                         f"path not found: {p}")
         items.append({**entry, "_path": p})
 
     t0 = time.monotonic()
@@ -1444,7 +1448,7 @@ async def align_manifest(payload: dict = Body(...)):
         )
     except Exception as e:
         log.exception("Manifest alignment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise pub.PublicError("internal", detail=repr(e))
     result["model"] = _ALIGN_MODEL_LABEL
     log.info("Aligned manifest (%d entries) in %.2fs: %d segments, %d chars",
              len(items), time.monotonic() - t0,
@@ -2659,11 +2663,7 @@ async def ws_transcribe(ws: WebSocket):
         except Exception:
             log.exception("forced weights re-check failed")
         try:
-            await send_json({
-                "type": "error",
-                "code": "model_unavailable",
-                "error": str(e),
-            })
+            await send_json(pub.ws_error("model_unavailable", slog.session_id, detail=repr(e)))
         except Exception:
             pass
         try:
@@ -2674,7 +2674,7 @@ async def ws_transcribe(ws: WebSocket):
         log.exception("WebSocket error: %s", e)
         slog.event("error", {"message": str(e)})
         try:
-            await send_json({"error": str(e)})
+            await send_json(pub.ws_error("internal", slog.session_id, detail=repr(e)))
         except Exception:
             pass
     finally:
