@@ -121,3 +121,28 @@ def test_window_resets_at_a_pause_not_mid_word():
     backend.feed_stream(stream, np.zeros(5000, dtype=np.float32))  # a pause
     assert len(decoder.contexts) == 2, "the pause past 75% of the window seals"
     assert stream.committed_text == "one two three."
+
+
+class StftDecoder(Decoder):
+    """Like the real extractor: a buffer of 200 samples or fewer cannot be padded."""
+
+    def finish_streaming_transcribe(self, state, max_new_tokens=None):
+        if state.buffer.size <= 200:
+            raise RuntimeError(
+                "Padding size should be less than the input dimension")
+        return super().finish_streaming_transcribe(state, max_new_tokens)
+
+
+@pytest.mark.parametrize("tail", [0, 1, 160, 200, 201, 399, 400, 2560])
+def test_stop_survives_any_tail_length_and_keeps_the_transcript(tail):
+    # tail 400 and 2560 are the normal-length controls: reach the decoder untouched.
+    decoder = StftDecoder(feeds=[("ok so", "ok")], finals=["ok so fix it now"])
+    backend = R2T2Backend(decoder, chunk_seconds=.16, window_seconds=20,
+                          max_transcript_chars=100)
+    stream = backend.init_stream("")
+    backend.feed_stream(stream, np.full(2560, .1, dtype=np.float32))
+    stream.state.buffer = np.full(tail, .1, dtype=np.float32)
+
+    assert backend.finish_stream(stream) == "ok so fix it now"
+    size = decoder.finish_buffer_sizes[-1]
+    assert size == max(tail, 400) if tail else size > 200

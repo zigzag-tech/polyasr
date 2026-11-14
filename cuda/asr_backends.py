@@ -15,8 +15,15 @@ SAMPLE_RATE = 16000
 SEAL_MAX_NEW_TOKENS = 128
 # Upstream finish_streaming_transcribe() returns its last text WITHOUT decoding
 # when its buffer is empty (about half of all stops with 80 ms frames and
-# 160 ms chunks). Handing it this much silence makes it always decode.
-SEAL_PAD_SAMPLES = SAMPLE_RATE // 100
+# 160 ms chunks). Handing it silence makes it always decode; the amount is
+# SEAL_MIN_SAMPLES below, which is also the shortest tail the STFT accepts.
+# The feature extractor's STFT reflect-pads 200 samples (n_fft 400 / 2) on each
+# side, which torch rejects ("Padding size should be less than the input
+# dimension") for any buffer of 200 samples or fewer. A stop whose tail is 1..399
+# samples (e.g. a 160-sample remainder) crashed the stop path and dropped the
+# whole finalize. Zero-padding the tail to one full STFT window also what the
+# empty-buffer case needs, and zeros add no speech.
+SEAL_MIN_SAMPLES = 400
 # Reset the context window at a pause rather than at an arbitrary sample: a
 # fresh decoder state mid-word produced "two 6" for "two weeks" at the 20 s mark.
 # Once this fraction of the window is used, a quiet run of SEAL_QUIET_SEC seals.
@@ -163,8 +170,12 @@ class R2T2Backend:
     def _seal(self, stream: R2T2Stream) -> str:
         """Decode everything not yet emitted, always, with room to catch up."""
         buffer = getattr(stream.state, "buffer", None)
-        if buffer is None or np.asarray(buffer).size == 0:
-            stream.state.buffer = np.zeros(SEAL_PAD_SAMPLES, dtype=np.float32)
+        tail = (np.zeros(0, dtype=np.float32) if buffer is None
+                else np.asarray(buffer, dtype=np.float32).reshape(-1))
+        if tail.size < SEAL_MIN_SAMPLES:
+            stream.state.buffer = np.concatenate(
+                [tail, np.zeros(SEAL_MIN_SAMPLES - tail.size, dtype=np.float32)]
+            )
         final_local = self.model.finish_streaming_transcribe(
             stream.state, max_new_tokens=SEAL_MAX_NEW_TOKENS
         )
