@@ -3050,7 +3050,7 @@ if __name__ == "__main__":
     # differs from this one.
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host=os.environ.get("LIVESTACK_LISTEN_HOST", "0.0.0.0"),
         port=int(_env("PORT", "8765")),
         log_level="info",
     )
