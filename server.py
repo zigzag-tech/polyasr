@@ -606,8 +606,8 @@ _UNITS = {
 }
 # The manager + residency policy (LocalCoordinator standalone, or livestack's
 # LivestackCoordinator) is wired by attach() once `app` exists, below.
-manager = None      # polycore.ModelManager, set by attach() / fallback below
-residence = None    # LivestackCoordinator (None in standalone mode)
+manager = None      # polycore.ModelManager: inert below, replaced by _attach_livestack()
+residence = None    # LivestackCoordinator (None until _attach_livestack())
 
 
 def get_session():
@@ -911,28 +911,41 @@ def _gpu_call(fn):
     return _gpu_executor.submit(fn).result()
 
 
-# Become a livestack node: lease-driven residence exposed under /livestack, so a
-# host-broker can arbitrate Metal VRAM across this ASR server and co-resident
-# TTS/renderer. Without livestack_node, polycore's LocalCoordinator reproduces the
-# standalone COLOAD + idle-evict behaviour unchanged.
-try:
-    from livestack_node import attach
-    # `port` is what lets this node report for duty to the host broker on its
-    # own — no LIVESTACK_PEERS entry, no broker restart. It is the one fact the
-    # broker cannot infer (a POST shows it our source address, not what we
-    # listen on), and it is the same value we hand uvicorn at the bottom.
-    def _inventory() -> dict:
-        return evidence_inventory(backend="qwen-mlx", model=MODEL_NAME,
-                                  model_revision=MODEL_REVISION, streaming="synthetic",
-                                  evidence=_asr_evidence)
+# Importing this module must stay inert: `manager` starts as a broker-less
+# ModelManager (no threads, no network) so tests that import the module have
+# something to call. Only the server entry point (`__main__`, below) attaches
+# to Livestack. attach() starts the registrar that reports this port to the
+# host broker, mesh attach, the idle sweep and the host-RAM ledger. When it
+# ran at import, pytest on a serving host (zz-joe, 2026-11-21) registered the
+# TEST process with the live broker under the live engine's own address.
+# test_import_isolation.py pins this down.
+manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
 
-    manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
-                                idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
-                                in_flight=_busy, inventory=_inventory)
-    log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
-except ImportError as exc:
-    raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
+
+def _attach_livestack() -> None:
+    """Become a livestack node: lease-driven residence exposed under /livestack,
+    so a host-broker can arbitrate Metal VRAM across this ASR server and
+    co-resident TTS/renderer. Call once, before uvicorn starts (attach() adds
+    middleware). The server refuses to run without livestack_node."""
+    global manager, residence
+    try:
+        from livestack_node import attach
+        # `port` is what lets this node report for duty to the host broker on its
+        # own — no LIVESTACK_PEERS entry, no broker restart. It is the one fact the
+        # broker cannot infer (a POST shows it our source address, not what we
+        # listen on), and it is the same value we hand uvicorn at the bottom.
+        def _inventory() -> dict:
+            return evidence_inventory(backend="qwen-mlx", model=MODEL_NAME,
+                                      model_revision=MODEL_REVISION, streaming="synthetic",
+                                      evidence=_asr_evidence)
+
+        manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
+                                    idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
+                                    gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
+                                    in_flight=_busy, inventory=_inventory)
+        log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
+    except ImportError as exc:
+        raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 
 @app.on_event("startup")
@@ -3031,8 +3044,12 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
 
 
 if __name__ == "__main__":
+    _attach_livestack()
+    # Serve THIS module's app. A "server:app" string made uvicorn import the
+    # file a second time as `server`, i.e. a second module whose attach state
+    # differs from this one.
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
         port=int(_env("PORT", "8765")),
         log_level="info",

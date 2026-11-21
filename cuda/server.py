@@ -45,12 +45,12 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Shared poly* modules live in the repo root; this server runs from cuda/.
 # Append (not insert) so the root-level MLX server.py never shadows this module
-# when uvicorn imports "server:app".
+# when this file is imported as `server`.
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
-from livestack_node import ManagedUnit, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
+from livestack_node import ManagedUnit, ModelManager, ResidencyPolicy, free_cuda, trim_ram  # noqa: E402
 import polyasr_align  # noqa: E402
 import polyasr_public_errors as pub  # noqa: E402
 import polyasr_diarize  # noqa: E402
@@ -507,8 +507,8 @@ _UNITS = {
     "align": ManagedUnit("align", _load_align_model, free_cuda, footprint=3_000_000_000),
     "diarize": ManagedUnit("diarize", _load_diarize_model, free_cuda, footprint=2_500_000_000),
 }
-manager = None      # polycore.ModelManager, set by attach() / fallback below
-residence = None    # LivestackCoordinator (None in standalone mode)
+manager = None      # polycore.ModelManager: inert below, replaced by _attach_livestack()
+residence = None    # LivestackCoordinator (None until _attach_livestack())
 
 
 def get_session():
@@ -828,38 +828,51 @@ def _gpu_call(fn):
         return fn()
 
 
-# Wire the polycore manager + residency. With livestack present this becomes a
-# livestack node (lease-driven residence, exposed under /livestack); without it,
-# polycore's LocalCoordinator reproduces the standalone COLOAD + idle-evict.
-try:
-    from livestack_node import attach
-    # `port` is what lets this node report for duty to the host broker on its
-    # own — no LIVESTACK_PEERS entry, no broker restart. Same value we hand
-    # uvicorn below; the broker cannot infer it, because a POST shows it our
-    # source address, not what we listen on.
-    # `in_flight` is now a first-class attach() argument rather than something
-    # smuggled through `readiness()`. The facade labels it
-    # `load.in_flight_source: "server"`, which is the part a consumer needs: it
-    # tells 0-because-idle apart from 0-because-this-node-cannot-see-its-work.
-    def _count() -> int:
-        with _in_flight_lock:
-            return _in_flight_count
+# Importing this module must stay inert: `manager` starts as a broker-less
+# ModelManager (no threads, no network) so tests that import the module have
+# something to call. Only the server entry point (`__main__`, below) attaches
+# to Livestack. attach() starts the registrar that reports this port to the
+# host broker, mesh attach, the idle sweep and the host-RAM ledger. When it
+# ran at import, pytest on zz-joe (2026-11-21) registered the TEST process with
+# the live broker under the live engine's own address, 127.0.0.1:8766/livestack.
+# test_import_isolation.py pins this down.
+manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
 
-    def _inventory() -> dict:
-        cfg = _asr_settings()
-        name = backend_controller.active or cfg["backend"]
-        selected = cfg[name]
-        streaming = "native" if name == "r2t2" or selected.get("native_streaming") else "synthetic"
-        return evidence_inventory(backend=name, model=selected["model"],
-                                  model_revision=selected["revision"], streaming=streaming,
-                                  evidence=_asr_evidence)
 
-    manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
-                                idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
-                                gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
-                                in_flight=_count, inventory=_inventory)
-except ImportError as exc:
-    raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
+def _attach_livestack() -> None:
+    """Become a livestack node: lease-driven residence exposed under /livestack.
+    Call once, before uvicorn starts (attach() adds middleware). The server
+    refuses to run without livestack_node: no standalone GPU residency."""
+    global manager, residence
+    try:
+        from livestack_node import attach
+        # `port` is what lets this node report for duty to the host broker on its
+        # own — no LIVESTACK_PEERS entry, no broker restart. Same value we hand
+        # uvicorn below; the broker cannot infer it, because a POST shows it our
+        # source address, not what we listen on.
+        # `in_flight` is now a first-class attach() argument rather than something
+        # smuggled through `readiness()`. The facade labels it
+        # `load.in_flight_source: "server"`, which is the part a consumer needs: it
+        # tells 0-because-idle apart from 0-because-this-node-cannot-see-its-work.
+        def _count() -> int:
+            with _in_flight_lock:
+                return _in_flight_count
+
+        def _inventory() -> dict:
+            cfg = _asr_settings()
+            name = backend_controller.active or cfg["backend"]
+            selected = cfg[name]
+            streaming = "native" if name == "r2t2" or selected.get("native_streaming") else "synthetic"
+            return evidence_inventory(backend=name, model=selected["model"],
+                                      model_revision=selected["revision"], streaming=streaming,
+                                      evidence=_asr_evidence)
+
+        manager, residence = attach(app, host_id=HOST_ID, kind="polyasr", units=_UNITS,
+                                    idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
+                                    gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
+                                    in_flight=_count, inventory=_inventory)
+    except ImportError as exc:
+        raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 
 async def _idle_evict_loop():
@@ -2620,8 +2633,12 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
 
 
 if __name__ == "__main__":
+    _attach_livestack()
+    # Serve THIS module's app. A "server:app" string made uvicorn import the
+    # file a second time as `server`, i.e. a second module whose attach state
+    # differs from this one.
     uvicorn.run(
-        "server:app",
+        app,
         host=os.environ.get("LIVESTACK_LISTEN_HOST", "0.0.0.0"),
         port=int(_env("PORT", "8766")),
         log_level="info",
