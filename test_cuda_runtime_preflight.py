@@ -26,41 +26,42 @@ class RuntimePreflightTest(unittest.TestCase):
     def test_accepts_matching_stack(self):
         modules = {
             "torch": SimpleNamespace(
-                __version__="2.11.0+cu129",
-                version=SimpleNamespace(cuda="12.9"),
+                __version__="2.14.1+cu126",
+                version=SimpleNamespace(cuda="12.6"),
             ),
             "torchaudio": SimpleNamespace(
-                __version__="2.11.0+cu129",
-                version=SimpleNamespace(cuda="12.9"),
+                __version__="2.11.0+cu126",
+                version=SimpleNamespace(cuda="12.6"),
             ),
-            "torchvision": SimpleNamespace(__version__="0.26.0+cu129"),
+            "torchvision": SimpleNamespace(__version__="0.29.1+cu126"),
             "silero_vad": SimpleNamespace(),
             "resemblyzer": SimpleNamespace(),
         }
 
         result = validate_pytorch_stack(import_module=modules.__getitem__)
 
-        self.assertEqual(result["torch"], "2.11.0+cu129")
-        self.assertEqual(result["cuda"], "12.9")
+        self.assertEqual(result["torch"], "2.14.1+cu126")
+        self.assertEqual(result["torchaudio"], "2.11.0+cu126")
+        self.assertEqual(result["cuda"], "12.6")
 
     def test_accepts_torchaudio_without_exposed_cuda_version(self):
         modules = {
             "torch": SimpleNamespace(
-                __version__="2.11.0+cu129",
-                version=SimpleNamespace(cuda="12.9"),
+                __version__="2.14.1+cu126",
+                version=SimpleNamespace(cuda="12.6"),
             ),
             "torchaudio": SimpleNamespace(
-                __version__="2.11.0+cu129",
+                __version__="2.11.0+cu126",
                 version=SimpleNamespace(cuda=None),
             ),
-            "torchvision": SimpleNamespace(__version__="0.26.0+cu129"),
+            "torchvision": SimpleNamespace(__version__="0.29.1+cu126"),
             "silero_vad": SimpleNamespace(),
             "resemblyzer": SimpleNamespace(),
         }
 
         result = validate_pytorch_stack(import_module=modules.__getitem__)
 
-        self.assertEqual(result["torchaudio"], "2.11.0+cu129")
+        self.assertEqual(result["torchaudio"], "2.11.0+cu126")
 
 
 if __name__ == "__main__":

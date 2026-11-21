@@ -37,7 +37,7 @@ asr-server-cuda/
 cd ~/benchday/asr-server-cuda
 python3 -m venv venv
 ./venv/bin/pip install -U pip wheel
-./venv/bin/pip install --index-url https://download.pytorch.org/whl/cu129 torch torchaudio
+./venv/bin/pip install --index-url https://download.pytorch.org/whl/cu126 torch torchaudio torchvision
 ./venv/bin/pip install -r requirements.txt
 
 sudo cp benchday-zzasr.service /etc/systemd/system/

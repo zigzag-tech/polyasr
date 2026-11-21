@@ -16,10 +16,10 @@ if [[ ! -x "${venv_dir}/bin/python" ]]; then
     python3 -m venv "${venv_dir}"
 fi
 
-"${venv_dir}/bin/python" -m pip install -r "${repo_dir}/cuda/pytorch-cu129.txt"
+"${venv_dir}/bin/python" -m pip install -r "${repo_dir}/cuda/pytorch-cu126.txt"
 "${venv_dir}/bin/python" -m pip install \
     --index-url "${POLYASR_PYPI_INDEX:-https://pypi.org/simple}" \
-    -c "${repo_dir}/cuda/constraints-cu129.txt" \
+    -c "${repo_dir}/cuda/constraints-cu126.txt" \
     -r "${repo_dir}/cuda/requirements.txt"
 "${venv_dir}/bin/python" -m pip check
 "${venv_dir}/bin/python" "${repo_dir}/cuda/runtime_preflight.py"

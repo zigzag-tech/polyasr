@@ -1,35 +1,40 @@
 # ASR model (Apple Silicon MLX)
-mlx-qwen3-asr==0.3.5
+mlx-qwen3-asr==0.4.4
 # Forced alignment for /v1/align: loads an MLX Qwen3-ASR model plus an MLX
-# Qwen3-ForcedAligner model via mlx_audio.stt.load_model. Verified on 0.4.4
-# (pulls mlx>=0.31.2, mlx-lm, transformers, tokenizers, safetensors, miniaudio).
-mlx-audio==0.4.4
+# Qwen3-ForcedAligner model via mlx_audio.stt.load_model. 0.6.7 pulls
+# mlx>=0.32.4 and transformers>=5.14. Load + generate + align of the 4-bit
+# mlx-community models verified on Linux mlx-cpu (2026-11-21), not yet on Metal.
+mlx-audio==0.6.7
 
 # Web framework
-fastapi==0.135.3
-uvicorn==0.43.0
-python-multipart==0.0.24
-websockets==16.0
+fastapi==0.165.0
+uvicorn==0.54.0
+python-multipart==0.0.34
+websockets==17.4
 
 # VAD and speaker embedding
-silero-vad==6.2.1
+silero-vad==6.2.3
 Resemblyzer==0.1.4
 # Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
-pyannote.audio>=4.0
-typeguard==4.4.4
-setuptools==80.9.0
-onnxruntime==1.24.4
-torch==2.11.0
-torchaudio==2.11.0
+pyannote.audio==4.1.1
+typeguard==4.6.1
+# 81.0.0 is the last setuptools that still ships pkg_resources (removed in 82),
+# which webrtcvad 2.0.10 (via Resemblyzer) imports.
+setuptools==81.0.0
+onnxruntime==1.32.0
+# 2.14.1, not 2.15: the newest TorchCodec (0.17, pulled by pyannote) is built
+# against torch 2.14, and the CUDA backend is held at 2.14.1 too.
+torch==2.14.1
+torchaudio==2.11.1
 
 # Model hub client (used for snapshot_download)
-huggingface_hub==1.9.0
+huggingface_hub==2.4.0
 
 # Numerical
-numpy==2.4.4
+numpy==2.5.5
 
 # Audio I/O (used for writing per-session FLAC archives)
-soundfile>=0.12.1
+soundfile==0.14.0
 
 # Livestack model-node kit (sibling repo ~/livestack).
 # Run pip from the polyasr repo root so the relative path resolves on every machine.

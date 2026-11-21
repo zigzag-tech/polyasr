@@ -33,14 +33,10 @@ def validate_pytorch_stack(import_module=importlib.import_module):
             "Reinstall the pinned CUDA stack with cuda/install.sh."
         )
 
-    torch_release = torch.__version__.split("+", 1)[0].rsplit(".", 1)[0]
-    torchaudio_release = torchaudio.__version__.split("+", 1)[0].rsplit(".", 1)[0]
-    if torch_release != torchaudio_release:
-        raise RuntimeError(
-            "PyTorch/TorchAudio release mismatch: "
-            f"torch={torch.__version__}, torchaudio={torchaudio.__version__}. "
-            "Reinstall the pinned CUDA stack with cuda/install.sh."
-        )
+    # No torch/torchaudio release-equality check: TorchAudio's last line (2.11)
+    # builds against torch's stable ABI and runs under newer torch (2.11.0 under
+    # 2.14.1 is the pinned stack), so a release mismatch is expected. A broken
+    # ABI still fails the extension import above.
 
     return {
         "torch": torch.__version__,

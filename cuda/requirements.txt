@@ -2,7 +2,7 @@
 # Target: zz-tower0 (RTX 3090). PyTorch wheels bundle their CUDA user-space
 # runtime, so Torch/TorchAudio/TorchVision must match each other; the NVIDIA
 # driver only needs to support that runtime. Use ./cuda/install.sh.
--c constraints-cu129.txt
+-c constraints-cu126.txt
 
 # ASR model (PyTorch/CUDA) — first-party from the Qwen team. Also provides the
 # Qwen3-ForcedAligner integration used by the /v1/align endpoint
@@ -13,25 +13,30 @@ qwen-asr==0.0.6
 
 # Audio I/O + numerics. ffmpeg (system binary) is required by /v1/align for
 # decoding non-WAV uploads + chunking long audio.
-soundfile==0.13.1
-numpy==2.4.4
+soundfile==0.14.0
+# numpy 2.5 needs Python 3.12; zz-tower0's cuda/venv is still Python 3.11.
+numpy==2.5.5; python_version >= "3.12"
+numpy==2.4.6; python_version < "3.12"
 
 # Web framework
-fastapi==0.136.0
-uvicorn==0.46.0
-python-multipart==0.0.26
-websockets==13.1
+fastapi==0.165.0
+uvicorn==0.54.0
+python-multipart==0.0.34
+websockets==17.4
 
 # VAD and speaker embedding
-silero-vad==6.2.1
+silero-vad==6.2.3
 Resemblyzer==0.1.4
-onnxruntime-gpu==1.24.4
+# 1.26 is the last onnxruntime-gpu built for CUDA 12; 1.27+ needs CUDA 13
+# (driver >= 580), which zz-joe (driver 550) cannot load.
+onnxruntime-gpu==1.26.0
 # Speaker diarization for /v1/diarize (pyannote pipeline via polyasr_diarize).
-pyannote.audio==4.0.5
+pyannote.audio==4.1.1
 # Required by generate-parameter-library-py, whose package metadata omits it.
-typeguard==4.4.4
-# webrtcvad 2.0.10 (via Resemblyzer) still imports pkg_resources.
-setuptools==80.9.0
+typeguard==4.6.1
+# webrtcvad 2.0.10 (via Resemblyzer) still imports pkg_resources, and 81.0.0 is
+# the last setuptools that ships it (removed in 82).
+setuptools==81.0.0
 
 # Livestack model-node kit (sibling repo ~/livestack).
 # Run pip from the polyasr repo root: pip install -r cuda/requirements.txt

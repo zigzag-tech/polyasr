@@ -1,0 +1,14 @@
+# Keep the compiled PyTorch libraries on one tested release and CUDA ABI.
+# CUDA 12.6, not 13.x: zz-joe runs driver 550 (CUDA 12.4), which runs CUDA 12
+# wheels through minor-version compatibility but cannot run CUDA 13 wheels
+# (those need driver >= 580). torch 2.14.1 is the newest release with a CUDA 12
+# build; 2.15 ships cu132/cu134 only.
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126
+# TorchAudio's last release line is 2.11. It builds against torch's stable ABI
+# (declares torch>=2.11), so the cu126 build loads under torch 2.14.1; verified
+# on CPU (extension loads, resample + forced_align run). Not PyPI's 2.11.1:
+# that Linux wheel links libcudart.so.13.
+torchaudio==2.11.0+cu126
+# TorchCodec is compiled against one torch release (0.17 <-> torch 2.14).
+torchcodec==0.17.0
