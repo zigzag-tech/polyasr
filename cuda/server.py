@@ -107,6 +107,7 @@ DIARIZE_DEVICE = _env("DIARIZE_DEVICE", DEVICE)
 # Idle-evict the resident model after this many seconds (0 = never evict) so a
 # co-resident polytts/renderer can reclaim the GPU.
 IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
+WARM_ON_START = _envflag("WARM_ON_START", "0")
 # Co-residency: when on (default), loading a unit does NOT evict the other, so
 # benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
 # historical one-model-in-VRAM eviction behaviour.
@@ -479,13 +480,12 @@ HOST_ID = _env("HOST_ID", "zz-tower0")
 _RESIDENCY_TIERS = {"hard_pin": ResidencyPolicy.HARD_PIN,
                     "soft_pin": ResidencyPolicy.SOFT_PIN,
                     "unpinned": ResidencyPolicy.UNPINNED}
-_asr_tier = _env("ASR_RESIDENCY", "hard_pin").strip().lower()
+_asr_tier = _env("ASR_RESIDENCY", "unpinned").strip().lower()
 if _asr_tier not in _RESIDENCY_TIERS:
-    # A typo must not stop this node serving, and must not silently unpin the
-    # engine benchday depends on: fall back to the safe tier and say so.
-    log.warning("POLYASR_ASR_RESIDENCY=%r is not one of %s — using hard_pin",
+    # Invalid policy must not create an unevictable GPU floor.
+    log.warning("POLYASR_ASR_RESIDENCY=%r is not one of %s — using unpinned",
                 _asr_tier, ", ".join(sorted(_RESIDENCY_TIERS)))
-    _asr_tier = "hard_pin"
+    _asr_tier = "unpinned"
 _loaded_backend = None
 
 
@@ -858,9 +858,8 @@ try:
                                 idle_seconds=IDLE_EVICT_SECONDS, coload=COLOAD,
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8766")),
                                 in_flight=_count, inventory=_inventory)
-except ImportError:
-    from livestack_node import ModelManager
-    manager = ModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
+except ImportError as exc:
+    raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 
 async def _idle_evict_loop():
@@ -926,16 +925,20 @@ async def startup_event():
     get_encoder()
     if LOG_DIR is not None:
         prune_log_storage(LOG_DIR)
-    log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
-    # A failed preload does not exit: the process stays up with /health 503 and
-    # the config loop retries the activation with backoff (see
-    # RETRY_FIRST_SECONDS in backend_config.py for the boot-time VRAM race).
-    try:
-        with _transcribe_lock:
-            get_session()
-    except Exception as exc:
-        backend_controller.record_activation_failure(_asr_settings()["backend"], exc)
+    if WARM_ON_START:
+        log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
+        # A failed preload does not exit: the process stays up with /health 503 and
+        # the config loop retries the activation with backoff (see
+        # RETRY_FIRST_SECONDS in backend_config.py for the boot-time VRAM race).
+        try:
+            with _transcribe_lock:
+                get_session()
+        except Exception as exc:
+            backend_controller.record_activation_failure(_asr_settings()["backend"], exc)
+        else:
+            backend_controller.active = _asr_settings()["backend"]
     else:
+        # Configuration is selected; weights load only on real demand.
         backend_controller.active = _asr_settings()["backend"]
     asyncio.create_task(_idle_evict_loop())
     asyncio.create_task(_backend_config_loop())
@@ -2619,7 +2622,7 @@ async def _transcribe_buffer(audio_buffer: bytearray, context: str = "") -> str:
 if __name__ == "__main__":
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
+        host=os.environ.get("LIVESTACK_LISTEN_HOST", "0.0.0.0"),
         port=int(_env("PORT", "8766")),
         log_level="info",
     )

@@ -82,6 +82,7 @@ DIARIZE_DEVICE = _env("DIARIZE_DEVICE", "cpu")
 # Idle-evict the resident model after this many seconds (0 = never evict) so a
 # co-resident polytts/renderer can reclaim the GPU/Metal memory.
 IDLE_EVICT_SECONDS = int(_env("IDLE_EVICT_SECONDS", "180"))
+WARM_ON_START = _envflag("WARM_ON_START", "0")
 # Co-residency: when on (default), loading a unit does NOT evict the other, so
 # benchday's 'asr' stays warm even when unchain loads 'align'. Set to 0 for the
 # historical one-model-resident eviction behaviour.
@@ -595,11 +596,11 @@ def _load_diarize_model():
 # idle-evicted like the others. Either way idle-evict reclaims memory for a
 # co-resident polytts/renderer.
 # footprint = Metal bytes (weights + peak activation), mirrors the CUDA node's
-# estimates; refine with livestack_node.measure_footprint(). 'asr' is HARD_PIN so
-# the broker never evicts the primary dictation model for a co-resident TTS.
+# estimates; refine with livestack_node.measure_footprint(). All units yield
+# to Harmony; a dictation service must not impose a permanent GPU floor.
 _UNITS = {
     "asr": ManagedUnit("asr", _load_asr_model, free_mlx, footprint=5_000_000_000,
-                       residency_policy=ResidencyPolicy.HARD_PIN),
+                       residency_policy=ResidencyPolicy.UNPINNED),
     "align": ManagedUnit("align", _load_align_models, free_mlx, footprint=3_000_000_000),
     "diarize": ManagedUnit("diarize", _load_diarize_model, free_mlx, footprint=2_500_000_000),
 }
@@ -930,9 +931,8 @@ try:
                                 gpu_call=_gpu_call, port=int(_env("PORT", "8765")),
                                 in_flight=_busy, inventory=_inventory)
     log.info("livestack residence attached (host=%s, kind=polyasr)", HOST_ID)
-except ImportError:
-    manager = AsrModelManager(_UNITS, IDLE_EVICT_SECONDS, coload=COLOAD)
-    log.info("livestack_node absent; standalone LocalCoordinator")
+except ImportError as exc:
+    raise RuntimeError("PolyASR requires Livestack Harmony; refusing standalone GPU residency") from exc
 
 
 @app.on_event("startup")
@@ -945,7 +945,8 @@ async def startup_event():
         await _refresh_weights_state(force=True)
         return
     log.info("Model cache access: ok")
-    log.info("Pre-loading ASR model at startup (idle_evict=%ss)...", IDLE_EVICT_SECONDS)
+    log.info("ASR demand startup (warm_on_start=%s, idle_evict=%ss)",
+             WARM_ON_START, IDLE_EVICT_SECONDS)
 
     # Load the model ON the GPU worker thread so the MLX Metal stream is created
     # there, not on the event-loop thread. Every later eval also runs on this
@@ -953,7 +954,8 @@ async def startup_event():
     def _load_asr():
         with _transcribe_lock:
             get_session()
-    await _run_on_gpu(_load_asr)
+    if WARM_ON_START:
+        await _run_on_gpu(_load_asr)
     get_vad()
     get_encoder()
     log.info(
@@ -974,17 +976,18 @@ async def startup_event():
     # one: it warms the same partial path AND establishes probe freshness, so a
     # freshly-booted server isn't reported stale for its first keepwarm interval.
     global _PROBE_PCM
-    _PROBE_PCM = _load_probe_pcm()
+    _PROBE_PCM = _load_probe_pcm() if WARM_ON_START else None
     _probe_state["enabled"] = _PROBE_PCM is not None
-    try:
-        if _PROBE_PCM is not None:
-            await _run_streaming_probe()
-        else:
-            await _transcribe_buffer(bytearray(int(BYTES_PER_SEC * 0.3)))
-        log.info("Startup warmup complete (keepwarm interval=%.0fs, probe=%s).",
-                 ASR_KEEPWARM_INTERVAL_SEC, _probe_state["ok"])
-    except Exception:
-        log.exception("Startup warmup failed")
+    if WARM_ON_START:
+        try:
+            if _PROBE_PCM is not None:
+                await _run_streaming_probe()
+            else:
+                await _transcribe_buffer(bytearray(int(BYTES_PER_SEC * 0.3)))
+            log.info("Startup warmup complete (keepwarm interval=%.0fs, probe=%s).",
+                     ASR_KEEPWARM_INTERVAL_SEC, _probe_state["ok"])
+        except Exception:
+            log.exception("Startup warmup failed")
     asyncio.create_task(_keepwarm_loop())
     asyncio.create_task(_idle_evict_loop())
     log.info("Server ready.")
